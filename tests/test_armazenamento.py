@@ -1,6 +1,6 @@
 """Testa bootstrap do schema, gravação e consulta de histórico no metric store."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from obsdados.armazenamento import consultar_historico, gravar_resultado_metrica
@@ -27,14 +27,30 @@ def _resultado(**sobrescritas: Any) -> ResultadoMetrica:
 
 def test_gravar_e_consultar_historico() -> None:
     con = conectar_escrita(":memory:")
+    base = datetime(2026, 1, 5, 10, 0)
 
-    gravar_resultado_metrica(con, _resultado(valor=10.0))
-    gravar_resultado_metrica(con, _resultado(valor=20.0))
+    gravar_resultado_metrica(con, _resultado(valor=10.0, coletado_em=base))
+    gravar_resultado_metrica(con, _resultado(valor=20.0, coletado_em=base + timedelta(minutes=1)))
 
     historico = consultar_historico(con, "ds")
 
     assert len(historico) == 2
     assert {resultado.valor for resultado in historico} == {10.0, 20.0}
+
+
+def test_gravar_no_mesmo_minuto_e_idempotente() -> None:
+    """Duas coletas no mesmo minuto viram uma linha só, com o valor mais recente."""
+    con = conectar_escrita(":memory:")
+    minuto = datetime(2026, 1, 5, 10, 0, 5)
+    dez_segundos_depois = minuto + timedelta(seconds=10)
+
+    gravar_resultado_metrica(con, _resultado(valor=10.0, coletado_em=minuto))
+    gravar_resultado_metrica(con, _resultado(valor=99.0, coletado_em=dez_segundos_depois))
+
+    historico = consultar_historico(con, "ds")
+
+    assert len(historico) == 1
+    assert historico[0].valor == 99.0
 
 
 def test_consultar_historico_filtra_por_dataset() -> None:
@@ -50,8 +66,9 @@ def test_consultar_historico_filtra_por_dataset() -> None:
 
 def test_consultar_historico_respeita_limite() -> None:
     con = conectar_escrita(":memory:")
-    for _ in range(5):
-        gravar_resultado_metrica(con, _resultado())
+    base = datetime(2026, 1, 5, 10, 0)
+    for minuto in range(5):
+        gravar_resultado_metrica(con, _resultado(coletado_em=base + timedelta(minutes=minuto)))
 
     historico = consultar_historico(con, "ds", limite=2)
 

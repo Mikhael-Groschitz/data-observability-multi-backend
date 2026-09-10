@@ -10,8 +10,20 @@ _SQL_INSERIR = """
 INSERT INTO observabilidade.historico_metrica (
     dataset, tipo_metrica, dimensao, coluna, coletado_em, valor, valor_texto, status,
     tipo_amostragem, motivo_nao_suportado, mensagem_erro, backend, linhas_buscadas,
-    duracao_segundos, parametros_metrica
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    duracao_segundos, parametros_metrica, chave_idempotencia
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (chave_idempotencia) DO UPDATE SET
+    coletado_em = excluded.coletado_em,
+    valor = excluded.valor,
+    valor_texto = excluded.valor_texto,
+    status = excluded.status,
+    tipo_amostragem = excluded.tipo_amostragem,
+    motivo_nao_suportado = excluded.motivo_nao_suportado,
+    mensagem_erro = excluded.mensagem_erro,
+    backend = excluded.backend,
+    linhas_buscadas = excluded.linhas_buscadas,
+    duracao_segundos = excluded.duracao_segundos,
+    parametros_metrica = excluded.parametros_metrica
 """
 
 _SQL_CONSULTAR_BASE = """
@@ -23,8 +35,21 @@ WHERE dataset = ?
 """
 
 
+def _chave_idempotencia(resultado: ResultadoMetrica) -> str:
+    """Chave de (dataset, métrica, coluna, dimensão, minuto) — ver README sobre NULL em UNIQUE."""
+    minuto = resultado.coletado_em.strftime("%Y-%m-%dT%H:%M")
+    partes = [
+        resultado.dataset,
+        resultado.tipo_metrica.value,
+        resultado.coluna or "",
+        resultado.dimensao or "",
+        minuto,
+    ]
+    return "|".join(partes)
+
+
 def gravar_resultado_metrica(con: duckdb.DuckDBPyConnection, resultado: ResultadoMetrica) -> None:
-    """Grava um `ResultadoMetrica` como uma linha no histórico."""
+    """Grava um `ResultadoMetrica` como uma linha no histórico (upsert idempotente por minuto)."""
     parametros_json = json.dumps(dict(resultado.parametros)) if resultado.parametros else None
     con.execute(
         _SQL_INSERIR,
@@ -44,6 +69,7 @@ def gravar_resultado_metrica(con: duckdb.DuckDBPyConnection, resultado: Resultad
             resultado.linhas_buscadas,
             resultado.duracao_segundos,
             parametros_json,
+            _chave_idempotencia(resultado),
         ],
     )
 

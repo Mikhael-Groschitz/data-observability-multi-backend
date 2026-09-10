@@ -1,5 +1,6 @@
 """Avalia um dataset contra o contrato: lê o metric store, nunca a origem."""
 
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import duckdb
@@ -11,6 +12,7 @@ from obsdados.incidente import (
     Incidente,
     RegraIncidente,
     SeveridadeRegra,
+    StatusIncidente,
     consultar_incidentes_abertos,
     gravar_incidente,
     marcar_resolvido,
@@ -27,28 +29,37 @@ from obsdados.schema import ClassificacaoMudancaSchema, classificar_mudanca_sche
 _LIMITE_HISTORICO = 500
 _MINIMO_PONTOS_COMPARACAO = 2
 
+_Resultado = tuple[list[Incidente], list[Incidente]]
+"""(incidentes abertos nesta rodada, incidentes resolvidos nesta rodada)."""
+
+
+@dataclass
+class ResultadoAvaliacao:
+    abertos: list[Incidente] = field(default_factory=list)
+    resolvidos: list[Incidente] = field(default_factory=list)
+
 
 def avaliar_dataset(
     contrato: ContratoDataset, con_store: duckdb.DuckDBPyConnection, agora: datetime | None = None
-) -> list[Incidente]:
-    """Roda as regras do contrato para um dataset e devolve os incidentes novos desta rodada."""
+) -> ResultadoAvaliacao:
+    """Roda as regras do contrato para um dataset e devolve o que abriu e o que fechou agora."""
     momento = agora or datetime.now()
-    novos: list[Incidente] = []
+    resultado = ResultadoAvaliacao()
 
+    partes: list[_Resultado] = []
     if contrato.frescor:
-        novos += _sem_none(_avaliar_frescor(contrato, con_store, momento))
+        partes.append(_avaliar_frescor(contrato, con_store, momento))
     if contrato.volume:
-        novos += _sem_none(_avaliar_volume(contrato, con_store, momento))
+        partes.append(_avaliar_volume(contrato, con_store, momento))
     if contrato.schema_:
-        novos += _sem_none(_avaliar_schema(contrato, con_store, momento))
+        partes.append(_avaliar_schema(contrato, con_store, momento))
     for regra_nulos in contrato.nulos:
-        novos += _sem_none(_avaliar_nulos(contrato, regra_nulos, con_store, momento))
+        partes.append(_avaliar_nulos(contrato, regra_nulos, con_store, momento))
 
-    return novos
-
-
-def _sem_none(incidente: Incidente | None) -> list[Incidente]:
-    return [] if incidente is None else [incidente]
+    for abertos, resolvidos in partes:
+        resultado.abertos.extend(abertos)
+        resultado.resolvidos.extend(resolvidos)
+    return resultado
 
 
 def _registrar_ou_resolver(  # noqa: PLR0913
@@ -64,15 +75,20 @@ def _registrar_ou_resolver(  # noqa: PLR0913
     desvio: str,
     justificativa: str,
     agora: datetime,
-) -> Incidente | None:
-    abertos = consultar_incidentes_abertos(con, dataset, regra, coluna)
+) -> _Resultado:
+    abertos_no_store = consultar_incidentes_abertos(con, dataset, regra, coluna)
     if not disparou:
-        for incidente in abertos:
+        resolvidos = []
+        for incidente in abertos_no_store:
             if incidente.id is not None:
                 marcar_resolvido(con, incidente.id, agora)
-        return None
-    if abertos:
-        return None
+                atualizado = incidente.model_copy(
+                    update={"status": StatusIncidente.RESOLVIDO, "resolvido_em": agora}
+                )
+                resolvidos.append(atualizado)
+        return [], resolvidos
+    if abertos_no_store:
+        return [], []
     incidente = Incidente(
         dataset=dataset,
         regra=regra,
@@ -85,22 +101,22 @@ def _registrar_ou_resolver(  # noqa: PLR0913
         detectado_em=agora,
     )
     gravar_incidente(con, incidente)
-    return incidente
+    return [incidente], []
 
 
 def _avaliar_frescor(
     contrato: ContratoDataset, con: duckdb.DuckDBPyConnection, agora: datetime
-) -> Incidente | None:
+) -> _Resultado:
     regra = contrato.frescor
     if regra is None:
-        return None
+        return [], []
     historico = consultar_historico(
         con, contrato.dataset, tipo_metrica=TipoMetrica.FRESCOR, coluna=regra.coluna, limite=1
     )
     if not historico or historico[0].status != StatusResultadoMetrica.OK:
-        return None
+        return [], []
     if historico[0].valor is None:
-        return None
+        return [], []
 
     lag_segundos = historico[0].valor
     limite_segundos = regra.sla_horas * 3600
@@ -125,25 +141,25 @@ def _avaliar_frescor(
 
 def _avaliar_volume(
     contrato: ContratoDataset, con: duckdb.DuckDBPyConnection, agora: datetime
-) -> Incidente | None:
+) -> _Resultado:
     regra = contrato.volume
     if regra is None:
-        return None
+        return [], []
     historico = consultar_historico(
         con, contrato.dataset, tipo_metrica=TipoMetrica.CONTAGEM_LINHAS, limite=_LIMITE_HISTORICO
     )
     totais = [r for r in historico if r.dimensao is None and r.status == StatusResultadoMetrica.OK]
     if len(totais) < _MINIMO_PONTOS_COMPARACAO:
-        return None
+        return [], []
 
     atual, anteriores = totais[0], totais[1:]
     observacoes = [(r.coletado_em, r.valor) for r in anteriores if r.valor is not None]
     baselines = baseline_por_dia_semana(observacoes)
     baseline_do_dia = baselines.get(atual.coletado_em.weekday())
     if baseline_do_dia is None or baseline_do_dia.n_observacoes < regra.minimo_observacoes_baseline:
-        return None
+        return [], []
     if atual.valor is None:
-        return None
+        return [], []
 
     desvio_mads = baseline_do_dia.desvio_em_mads(atual.valor)
     disparou = desvio_mads > regra.limite_desvios_mad
@@ -173,10 +189,10 @@ def _avaliar_volume(
 
 def _avaliar_schema(
     contrato: ContratoDataset, con: duckdb.DuckDBPyConnection, agora: datetime
-) -> Incidente | None:
+) -> _Resultado:
     regra = contrato.schema_
     if regra is None:
-        return None
+        return [], []
     historico = consultar_historico(
         con, contrato.dataset, tipo_metrica=TipoMetrica.SCHEMA_HASH, limite=2
     )
@@ -184,7 +200,7 @@ def _avaliar_schema(
         r for r in historico if r.status == StatusResultadoMetrica.OK and r.valor_texto is not None
     ]
     if len(ok) < _MINIMO_PONTOS_COMPARACAO:
-        return None
+        return [], []
 
     atual, anterior = ok[0], ok[1]
     if atual.valor_texto == anterior.valor_texto:
@@ -205,9 +221,9 @@ def _avaliar_schema(
     colunas_anterior = _colunas_do_resultado(anterior)
     colunas_atual = _colunas_do_resultado(atual)
     if colunas_anterior is None or colunas_atual is None:
-        return None
+        return [], []
     if atual.valor_texto is None or anterior.valor_texto is None:
-        return None
+        return [], []
 
     classificacao, motivo = classificar_mudanca_schema(colunas_anterior, colunas_atual)
     severidade = (
@@ -239,14 +255,14 @@ def _colunas_do_resultado(resultado: ResultadoMetrica) -> list[ColunaSchema] | N
 
 def _avaliar_nulos(
     contrato: ContratoDataset, regra: RegraNulos, con: duckdb.DuckDBPyConnection, agora: datetime
-) -> Incidente | None:
+) -> _Resultado:
     historico = consultar_historico(
         con, contrato.dataset, tipo_metrica=TipoMetrica.TAXA_NULOS, coluna=regra.coluna, limite=1
     )
     if not historico or historico[0].status != StatusResultadoMetrica.OK:
-        return None
+        return [], []
     if historico[0].valor is None:
-        return None
+        return [], []
 
     taxa = historico[0].valor
     disparou = taxa > regra.limite_taxa

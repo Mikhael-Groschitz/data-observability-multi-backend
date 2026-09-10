@@ -71,10 +71,10 @@ def test_volume_incidente_quando_cai_pela_metade() -> None:
         con, _metrica(valor=500.0, coletado_em=primeira_segunda + timedelta(weeks=6))
     )
 
-    incidentes = avaliar_dataset(contrato, con)
+    resultado = avaliar_dataset(contrato, con)
 
-    assert len(incidentes) == 1
-    incidente = incidentes[0]
+    assert len(resultado.abertos) == 1
+    incidente = resultado.abertos[0]
     assert incidente.regra == RegraIncidente.VOLUME
     assert incidente.severidade == SeveridadeRegra.CRITICO
     assert "500" in incidente.valor_observado
@@ -94,9 +94,10 @@ def test_volume_partida_fria_nao_dispara_incidente() -> None:
         con, _metrica(valor=10.0, coletado_em=primeira_segunda + timedelta(weeks=2))
     )
 
-    incidentes = avaliar_dataset(contrato, con)
+    resultado = avaliar_dataset(contrato, con)
 
-    assert incidentes == []
+    assert resultado.abertos == []
+    assert resultado.resolvidos == []
     assert consultar_incidentes_abertos(con, contrato.dataset) == []
 
 
@@ -113,10 +114,12 @@ def test_volume_nao_duplica_incidente_e_resolve_quando_normaliza() -> None:
     )
 
     primeira_rodada = avaliar_dataset(contrato, con)
-    assert len(primeira_rodada) == 1
+    assert len(primeira_rodada.abertos) == 1
+    assert primeira_rodada.resolvidos == []
 
     segunda_rodada = avaliar_dataset(contrato, con)
-    assert segunda_rodada == []
+    assert segunda_rodada.abertos == []
+    assert segunda_rodada.resolvidos == []
     assert len(consultar_incidentes_abertos(con, contrato.dataset)) == 1
 
     gravar_resultado_metrica(
@@ -124,7 +127,9 @@ def test_volume_nao_duplica_incidente_e_resolve_quando_normaliza() -> None:
     )
     terceira_rodada = avaliar_dataset(contrato, con)
 
-    assert terceira_rodada == []
+    assert terceira_rodada.abertos == []
+    assert len(terceira_rodada.resolvidos) == 1
+    assert terceira_rodada.resolvidos[0].regra == RegraIncidente.VOLUME
     assert consultar_incidentes_abertos(con, contrato.dataset) == []
 
 
@@ -164,12 +169,12 @@ def test_schema_incidente_quebradora_quando_coluna_removida() -> None:
         ),
     )
 
-    incidentes = avaliar_dataset(contrato, con)
+    resultado = avaliar_dataset(contrato, con)
 
-    assert len(incidentes) == 1
-    assert incidentes[0].regra == RegraIncidente.SCHEMA
-    assert incidentes[0].severidade == SeveridadeRegra.CRITICO
-    assert "regiao" in incidentes[0].justificativa
+    assert len(resultado.abertos) == 1
+    assert resultado.abertos[0].regra == RegraIncidente.SCHEMA
+    assert resultado.abertos[0].severidade == SeveridadeRegra.CRITICO
+    assert "regiao" in resultado.abertos[0].justificativa
 
 
 def test_schema_incidente_aditiva_quando_coluna_nova() -> None:
@@ -198,11 +203,11 @@ def test_schema_incidente_aditiva_quando_coluna_nova() -> None:
         ),
     )
 
-    incidentes = avaliar_dataset(contrato, con)
+    resultado = avaliar_dataset(contrato, con)
 
-    assert len(incidentes) == 1
-    assert incidentes[0].severidade == SeveridadeRegra.AVISO
-    assert "novo_campo" in incidentes[0].justificativa
+    assert len(resultado.abertos) == 1
+    assert resultado.abertos[0].severidade == SeveridadeRegra.AVISO
+    assert "novo_campo" in resultado.abertos[0].justificativa
 
 
 def test_schema_sem_mudanca_nao_gera_incidente() -> None:
@@ -220,9 +225,10 @@ def test_schema_sem_mudanca_nao_gera_incidente() -> None:
             ),
         )
 
-    incidentes = avaliar_dataset(contrato, con)
+    resultado = avaliar_dataset(contrato, con)
 
-    assert incidentes == []
+    assert resultado.abertos == []
+    assert resultado.resolvidos == []
 
 
 # --- frescor: injeção de "carga atrasada" ----------------------------------------------------
@@ -238,11 +244,11 @@ def test_frescor_incidente_quando_atrasado() -> None:
         ),
     )
 
-    incidentes = avaliar_dataset(contrato, con)
+    resultado = avaliar_dataset(contrato, con)
 
-    assert len(incidentes) == 1
-    assert incidentes[0].regra == RegraIncidente.FRESCOR
-    assert "30" in incidentes[0].valor_observado or "1.25" in incidentes[0].valor_observado
+    assert len(resultado.abertos) == 1
+    assert resultado.abertos[0].regra == RegraIncidente.FRESCOR
+    assert "30" in resultado.abertos[0].valor_observado
 
 
 def test_frescor_dentro_do_sla_nao_gera_incidente() -> None:
@@ -252,9 +258,9 @@ def test_frescor_dentro_do_sla_nao_gera_incidente() -> None:
         con, _metrica(tipo_metrica=TipoMetrica.FRESCOR, coluna="criado_em", valor=3600.0)
     )
 
-    incidentes = avaliar_dataset(contrato, con)
+    resultado = avaliar_dataset(contrato, con)
 
-    assert incidentes == []
+    assert resultado.abertos == []
 
 
 # --- nulos ------------------------------------------------------------------------------------
@@ -267,11 +273,11 @@ def test_nulos_incidente_quando_acima_do_limite() -> None:
         con, _metrica(tipo_metrica=TipoMetrica.TAXA_NULOS, coluna="valor", valor=0.20)
     )
 
-    incidentes = avaliar_dataset(contrato, con)
+    resultado = avaliar_dataset(contrato, con)
 
-    assert len(incidentes) == 1
-    assert incidentes[0].regra == RegraIncidente.NULOS
-    assert incidentes[0].coluna == "valor"
+    assert len(resultado.abertos) == 1
+    assert resultado.abertos[0].regra == RegraIncidente.NULOS
+    assert resultado.abertos[0].coluna == "valor"
 
 
 def test_nulos_dentro_do_limite_nao_gera_incidente() -> None:
@@ -281,6 +287,6 @@ def test_nulos_dentro_do_limite_nao_gera_incidente() -> None:
         con, _metrica(tipo_metrica=TipoMetrica.TAXA_NULOS, coluna="valor", valor=0.01)
     )
 
-    incidentes = avaliar_dataset(contrato, con)
+    resultado = avaliar_dataset(contrato, con)
 
-    assert incidentes == []
+    assert resultado.abertos == []

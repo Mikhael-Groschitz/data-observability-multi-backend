@@ -60,6 +60,13 @@ class PoliticaAmostragem(BaseModel):
     fracao: float = Field(default=FRACAO_AMOSTRA_PADRAO, gt=0, le=1)
 
 
+class RegraAlertas(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ativo: bool = True
+    janela_silencio_minutos: int = Field(default=30, gt=0)
+
+
 class ContratoDataset(BaseModel):
     """O que o avaliador precisa saber sobre um dataset: onde olhar e o que esperar."""
 
@@ -73,6 +80,7 @@ class ContratoDataset(BaseModel):
     schema_: RegraSchema | None = Field(default=None, alias="schema")
     nulos: list[RegraNulos] = Field(default_factory=list)
     amostragem: PoliticaAmostragem = Field(default_factory=PoliticaAmostragem)
+    alertas: RegraAlertas = Field(default_factory=RegraAlertas)
 
 
 def carregar_contrato(caminho: str) -> ContratoDataset:

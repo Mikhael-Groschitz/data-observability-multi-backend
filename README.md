@@ -1,4 +1,4 @@
-# obsdados
+# Observabilidade de Dados Multi-Backend
 
 Serviço de observabilidade de dados: não move dado, observa dado que já foi
 movido por outro pipeline. O problema que resolve é o pipeline que termina com
@@ -20,26 +20,28 @@ Este é um projeto em fases:
 - [x] **Fase 1** — núcleo, protocolo de adapter, adapter DuckDB de referência, metric store.
 - [x] **Fase 2** — catálogo completo de métricas, segundo adapter (Postgres), amostragem, política de vazamento.
 - [x] **Fase 3** — contratos em YAML, baseline com mediana móvel e MAD, detecção de incidente.
-- [ ] **Fase 4** — alertas por webhook, API, página, agendamento.
+- [x] **Fase 4** — alertas por webhook, API, página, agendamento.
 - [ ] **Fase 5** — integração real, Docker Compose completo, CI.
 
 ## Arquitetura
 
 ```mermaid
 flowchart LR
-    C[contratos YAML] --> AV[avaliador]
-    COL[coletor] --> AD[adapters]
+    C[contratos YAML] --> AG[agendador]
+    AG --> COL[coletor]
+    AG --> AV[avaliador]
+    COL --> AD[adapters]
     AD -->|SQL empurrado| DB[("DuckDB / Postgres / SQL Server / Delta")]
     COL --> MS[(metric store)]
     MS --> AV
     AV --> MS
-    AV --> ALT[alertas]
-    AV --> API[API + página]
+    AV --> ALT[alerta: webhook]
+    MS --> API[API + página]
 ```
 
-Hoje existem `coletor`, `adapters` (DuckDB e Postgres), `metric store` e
-`avaliador` (que lê o contrato e o metric store, e escreve incidente de volta
-no store). `alertas` e `API + página` são o destino, ainda não construído.
+Todo o diagrama já existe. `agendador` roda o ciclo coleta→avaliação→alerta
+em intervalo fixo para os contratos de um diretório; `API + página` só lê o
+metric store, nunca escreve nele.
 
 ## O que o serviço faz hoje
 
@@ -99,9 +101,9 @@ no store). `alertas` e `API + página` são o destino, ainda não construído.
   mesmo dia da semana no histórico, o incidente estatístico de volume fica
   suspenso; as regras por limiar do contrato (frescor, nulos, schema)
   continuam valendo desde a primeira coleta.
-- **Severidade com efeito distinto, hoje** — aviso/erro/crítico definem o
-  código de saída de `obsdados avaliar` (0/1/2). Antes de existir alerta
-  (Fase 4), já dá pra usar isso para falhar um pipeline de CI.
+- **Severidade com efeito distinto** — aviso/erro/crítico definem o código de
+  saída de `obsdados avaliar` (0/1/2, útil pra falhar um step de CI) e
+  aparecem na primeira linha da mensagem do alerta.
 - **Incidente persistido com ciclo de vida** (`obsdados/incidente.py`) — cada
   disparo vira uma linha com valor observado, esperado, desvio e
   justificativa. Um incidente já aberto não duplica na rodada seguinte, e se
@@ -110,8 +112,27 @@ no store). `alertas` e `API + página` são o destino, ainda não construído.
   — inclusive o snapshot de colunas usado para classificar mudança de schema
   já foi coletado antes; avaliar um dataset não abre conexão nova com o banco
   observado.
-- **CLI** (`obsdados/cli.py`) — `obsdados coletar`, `obsdados historico` e
-  `obsdados avaliar`, contra DuckDB ou Postgres.
+- **Alerta por webhook (Discord ou Slack)** (`obsdados/alerta.py`) — corpo
+  legível (severidade, observado, esperado, desvio, justificativa em texto),
+  nunca um dump de JSON. Cada mudança de estado (abriu, resolveu) numa chave
+  de incidente fora da janela de silêncio manda uma mensagem; repetições da
+  *mesma* mudança dentro da janela agrupam num contador em vez de repetir.
+  Falha de rede ao notificar não derruba o ciclo de coleta.
+- **Escrita no metric store idempotente por minuto** (`obsdados/armazenamento.py`)
+  — duas coletas da mesma métrica dentro do mesmo minuto viram upsert, não
+  duas linhas.
+- **Ciclo e agendador** (`obsdados/ciclo.py`, `obsdados/agendador.py`) —
+  um ciclo coleta tudo que o contrato de um dataset pede, avalia e notifica;
+  o agendador repete isso para todos os contratos de um diretório, em
+  intervalo fixo.
+- **API em FastAPI, só leitura** (`obsdados/api.py`) — `/health` (serviço no
+  ar vs. metric store acessível), `/datasets` (estado atual),
+  `/datasets/{dataset}/historico`, `/incidentes` (abertos), e `/` com uma
+  página HTML simples (sem framework de frontend) listando datasets e
+  histórico recente.
+- **CLI** (`obsdados/cli.py`) — `coletar`, `historico`, `avaliar`, `agendar`
+  (roda o ciclo em loop, com `--ciclos` pra rodar um número fixo de vezes) e
+  `servir` (sobe a API).
 - **Log estruturado em JSON** via `structlog`, com dataset, métrica, duração e
   linhas trafegadas em cada coleta.
 
@@ -178,6 +199,37 @@ obsdados avaliar --contrato contratos/exemplo.yaml --store metricas.duckdb
 O código de saída é `0` sem incidente ou só aviso, `1` se o pior incidente for
 erro, `2` se for crítico — dá pra usar isso direto num step de CI.
 
+Para os incidentes também irem para um webhook, defina o destino por variável
+de ambiente (nunca no contrato — a URL de um webhook do Discord/Slack carrega
+um token, é credencial):
+
+```bash
+export OBSDADOS_WEBHOOK_URL=https://discord.com/api/webhooks/....
+export OBSDADOS_WEBHOOK_TIPO=discord   # ou slack
+obsdados avaliar --contrato contratos/exemplo.yaml --store metricas.duckdb
+```
+
+Rodar o ciclo completo (coleta + avaliação + alerta) para todos os contratos
+de um diretório, em loop:
+
+```bash
+obsdados agendar --contratos-dir contratos --store metricas.duckdb --intervalo-segundos 300
+```
+
+`--ciclos N` roda `N` rodadas e para — útil pra CI ou pra testar sem deixar
+rodando pra sempre.
+
+Subir a API e a página:
+
+```bash
+export OBSDADOS_METRIC_STORE_PATH=metricas.duckdb
+export OBSDADOS_CONTRATOS_DIR=contratos
+obsdados servir --porta 8000
+```
+
+`http://localhost:8000/` mostra a tabela de datasets; `/health`, `/datasets`,
+`/datasets/{dataset}/historico` e `/incidentes` respondem JSON.
+
 O resultado da coleta sai como uma linha JSON em stdout; o log estruturado vai
 para stderr. Os dois nunca se misturam, então dá para redirecionar a saída de
 resultado para um arquivo ou pipe sem filtrar log no meio.
@@ -208,9 +260,10 @@ escala com o volume porque o agregado roda inteiro dentro do banco; é essa
 independência que a regra de push-down existe para garantir. (Números de uma
 máquina de desenvolvimento comum — mostram ordem de grandeza, não SLA.)
 
-A suíte de testes completa (92 testes, incluindo os que rodam contra um
-Postgres real via Docker) roda em poucos segundos com o Postgres no ar, e pula
-os testes de Postgres — sem falhar — quando ele não está acessível.
+A suíte de testes completa (114 testes, incluindo os que rodam contra um
+Postgres real via Docker e os que sobem um servidor HTTP real para testar o
+webhook) roda em cerca de 18 segundos com o Postgres no ar, e pula os testes
+de Postgres — sem falhar — quando ele não está acessível.
 
 ### Anomalia sintética, de verdade (não só nos testes)
 
@@ -240,6 +293,45 @@ ficam abertos ao mesmo tempo no metric store. O cenário de volume pela metade
 reproduzido e verificado em `tests/test_avaliador.py::test_volume_incidente_quando_cai_pela_metade`,
 com os mesmos números: baseline de ~1002 linhas (mediana de 6 semanas),
 observação de 500, desvio de dezenas de MADs acima do limite de 5.
+
+### Ciclo completo: webhook e API de verdade, não só a avaliação
+
+Com um webhook local (um servidor HTTP de verdade, não um mock) e a API
+rodando, o mesmo cenário de frescor atrasado:
+
+```bash
+$ obsdados coletar --backend duckdb --db-origem origem_fase4.duckdb --tabela pedidos \
+    --dataset fase4.pedidos --tipo-metrica frescor --coluna criado_em --store metricas_fase4.duckdb
+$ obsdados avaliar --contrato contratos_fase4/demo.yaml --store metricas_fase4.duckdb
+# código de saída: 2
+```
+
+O webhook recebe, em texto legível (não um dump de JSON):
+
+```text
+[CRITICO] fase4.pedidos - frescor (coluna criado_em)
+Observado: 30.00 h sem atualizar
+Esperado: até 24.00 h (SLA do contrato)
+Desvio: 6.00 h acima do SLA
+coluna 'criado_em' de 'fase4.pedidos' está há 30.00 h sem dado novo — SLA do contrato é 24.00 h
+```
+
+E a API mostra o incidente aberto:
+
+```bash
+$ curl -s http://127.0.0.1:8000/incidentes
+[{"dataset":"fase4.pedidos","regra":"frescor","severidade":"critico","status":"aberto", ...}]
+$ curl -s http://127.0.0.1:8000/datasets
+[{"dataset":"fase4.pedidos","incidentes_abertos":1,"pior_severidade":"critico", ...}]
+```
+
+Atualizando o timestamp de origem para agora e repetindo `coletar` + `avaliar`,
+o incidente se resolve — `/incidentes` volta a `[]`, `/datasets` mostra
+`"incidentes_abertos":0`, e o webhook recebe uma segunda mensagem:
+
+```text
+[RESOLVIDO] fase4.pedidos - frescor voltou ao normal.
+```
 
 ## Decisões e trade-offs
 
@@ -289,9 +381,10 @@ lado conservador do erro.
 métricas são exatamente o que vaza dado real para o metric store. Sem uma
 declaração explícita de que aquela coluna pode ter o valor materializado, o
 adapter devolve `nao_suportado` com o motivo — nunca calcula e descarta, nunca
-finge. É um mecanismo provisório (`parametros.permite_valor`, hoje passado
-pela CLI ou por quem monta a `EspecificacaoMetrica`) até a Fase 3 trazer essa
-decisão para dentro do contrato declarativo por coluna.
+finge. Continua um controle por chamada (`parametros.permite_valor`, passado
+pela CLI ou por quem monta a `EspecificacaoMetrica`), não por coluna dentro do
+contrato — o contrato ganhou regras pra frescor/volume/schema/nulos, mas não
+chegou a cobrir esse mecanismo.
 
 **Metric store em DuckDB, com escrita curta em vez de concorrência real.**
 DuckDB não permite uma conexão `read_only=True` concorrente com uma conexão de
@@ -321,12 +414,15 @@ disso, a mediana de 2 ou 3 pontos é fácil demais de acertar por coincidência.
 O número é configurável por contrato (`minimo_observacoes_baseline`) porque
 um dataset com coleta mensal, por exemplo, precisa de outro valor.
 
-**Dedup de incidente por estado, não por janela de tempo.** Um incidente só é
-criado se não existir outro já aberto para a mesma (dataset, regra, coluna);
-reavaliar sem nada mudar não duplica linha. Isso não é a janela de silêncio
-que a Fase 4 vai trazer para alertas (que lida com tempo) — é mais simples:
-um problema continua sendo o mesmo problema até se resolver, não importa
-quantas vezes o avaliador rodar nesse meio tempo.
+**Duas camadas de dedup, uma por estado e outra por tempo — e são coisas
+diferentes.** O incidente dedupe por *estado*: só existe uma linha aberta por
+(dataset, regra, coluna) até resolver, não importa quantas vezes o avaliador
+rodar nesse meio tempo. O alerta dedupe por *tempo*: dentro da janela de
+silêncio, repetições do mesmo evento agrupam num contador em vez de mandar
+mensagem de novo. Fundir as duas camadas seria mais simples, mas erraria o
+caso que mais importa: uma mudança de estado (abriu → resolveu) sempre precisa
+notificar na hora, mesmo que a última notificação tenha sido há um minuto —
+ver "O que quebrou".
 
 **Diff de schema precisa do snapshot de colunas, não só do hash.** O hash
 sozinho diz "mudou", não "o quê" — para classificar aditiva vs. quebradora, o
@@ -349,6 +445,36 @@ devolve no erro de validação. Erro de sintaxe YAML já vem com linha do
 próprio parser; erro de validação (campo errado, tipo errado) precisa desse
 passo a mais.
 
+**Idempotência por chave calculada, não pelas colunas direto.** A ideia óbvia
+pra "duas coletas no mesmo minuto não duplicam" é um índice `UNIQUE` em
+`(dataset, tipo_metrica, coluna, dimensao, minuto)`. Testei antes de escrever
+essa versão: `coluna` e `dimensao` costumam ser `NULL` (contagem total, por
+exemplo, não tem nenhuma das duas), e SQL trata `NULL` como diferente de
+`NULL` — o `UNIQUE` nunca colidiria justamente no caso mais comum. A chave real
+é uma string com essas colunas resolvidas para `''` antes de comparar, e o
+`UNIQUE`/`ON CONFLICT ... DO UPDATE` fica nessa coluna calculada.
+
+**Webhook: Discord e Slack, mensagem sempre em texto.** O corpo é sempre uma
+string pronta pra ler (severidade, observado, esperado, desvio, justificativa),
+nunca o `Incidente` serializado — o payload muda por backend (`content` no
+Discord, `text` no Slack), mas o texto dentro é o mesmo. Falha ao notificar
+(rede fora, URL errada) fica só num log de aviso; nunca derruba o ciclo de
+coleta por causa de um alerta que não saiu.
+
+**Ciclo com uma conexão de escrita só, do início ao fim.** Coletar tudo que o
+contrato pede, avaliar e notificar acontece com uma única conexão de escrita
+aberta (abre, faz tudo, `CHECKPOINT`, fecha) — mantém a janela de escrita curta
+da Fase 1 mesmo com mais passos dentro dela. O agendador repete isso por
+contrato, com a função de espera entre ciclos injetável (mesmo padrão do retry
+de leitura), pra testar quantos ciclos rodam e quando dorme sem esperar tempo
+de parede de verdade.
+
+**API não conecta na origem, só no metric store.** Todo endpoint (`/health`,
+`/datasets`, histórico, incidentes, a página) lê exclusivamente o metric
+store, em modo `read_only`. Isso é consequência direta de o avaliador também
+só ler o store — não existe nenhum caminho de código, nem por engano, onde
+subir a API tocaria um banco observado.
+
 **Sem machine learning.** A detecção deste projeto, mesmo nas fases futuras, é
 estatística simples e explicável — mediana móvel com desvio absoluto mediano,
 não um modelo. Um alerta que ninguém no time consegue justificar em uma frase
@@ -363,10 +489,11 @@ tabela errada) e devolve um `ResultadoMetrica` com status `erro` — mas sem um
 chamada seguinte na mesma conexão falha com "current transaction is aborted",
 mesmo sendo uma métrica perfeitamente válida. Isso não aparece testando uma
 métrica de cada vez, isolada — só aparece coletando várias métricas em
-sequência na mesma conexão, que é exatamente como o coletor real vai operar a
-partir da Fase 4. Corrigido com `rollback()` em todo bloco de exceção, e travado
-por um teste que provoca o erro de propósito e confirma que a chamada seguinte
-ainda funciona.
+sequência na mesma conexão, que é exatamente como o `ciclo` da Fase 4 opera
+(um contrato pode pedir frescor, volume, schema e nulos na mesma rodada).
+Corrigido com `rollback()` em todo bloco de exceção, e travado por um teste
+que provoca o erro de propósito e confirma que a chamada seguinte ainda
+funciona.
 
 **`pg_class.reltuples` não é zero numa tabela vazia de estatística — é `-1`.**
 A tentação óbvia era `if reltuples > limite: usa amostra`; numa tabela recém
@@ -375,6 +502,22 @@ relevante) até alguém rodar `ANALYZE` manualmente — o que este serviço se
 recusa a fazer. Preferi deixar esse comportamento explícito (tamanho
 desconhecido → varredura completa) a escondê-lo atrás de uma comparação que
 parece funcionar.
+
+**A notificação de encerramento nunca saía — a própria janela de silêncio
+engolia ela.** Este foi pego só na validação manual de ponta a ponta, não nos
+testes unitários de `notificar_incidente` (que testavam cada chamada isolada).
+O desenho original checava só "quando foi a última notificação pra esta
+chave" — sem olhar o tipo de evento. Um incidente que abre e resolve na coleta
+seguinte (o caso comum: a rodada seguinte já vem com o dado normalizado) tenta
+mandar "resolvido" segundos depois de mandar "aberto", bem dentro da janela
+padrão de 30 minutos — e a checagem de janela suprimia, tratando a resolução
+como se fosse só mais um aviso repetido do mesmo problema. Na prática, a
+notificação de encerramento quase nunca saía. Rodando o cenário completo (webhook
+real recebendo, não mock) pra escrever a seção de demonstração deste README, a
+segunda mensagem simplesmente não chegava — o que expôs o bug. Corrigido
+comparando também `ultimo_evento`: a janela só agrupa repetição do *mesmo*
+evento; uma mudança de aberto para resolvido (ou o contrário) sempre notifica
+na hora. Travado por um teste que reproduz exatamente essa sequência.
 
 ## Por que não Great Expectations, Soda ou Elementary
 
@@ -405,7 +548,7 @@ Em uma máquina limpa, com Python 3.12, `uv` e Docker instalados:
 
 ```bash
 git clone <repositório>
-cd projeto-observalidade-dados
+cd data-observability-multi-backend
 uv sync --extra dev
 docker compose up -d postgres   # opcional: sem isso, os testes de Postgres são pulados
 uv run pytest
@@ -435,12 +578,25 @@ apontar para esse `origem.duckdb`/`pedidos` e rode:
 uv run obsdados avaliar --contrato contratos/exemplo.yaml --store metricas.duckdb
 ```
 
+Para ver a API e a página:
+
+```bash
+export OBSDADOS_METRIC_STORE_PATH=metricas.duckdb
+export OBSDADOS_CONTRATOS_DIR=contratos
+uv run obsdados servir --porta 8000
+# em outro terminal:
+curl http://localhost:8000/health
+curl http://localhost:8000/datasets
+```
+
+Para ver o alerta saindo de verdade, aponte `OBSDADOS_WEBHOOK_URL` para um
+webhook real do Discord/Slack (ou para um servidor HTTP local, como os testes
+de `tests/test_alerta.py` fazem) antes de rodar `obsdados avaliar`.
+
 Nenhum dos arquivos `.duckdb` gerados aqui deve ser commitado — o
 `.gitignore` já cobre isso, junto com `.env`.
 
 ## Próximos passos
 
-- **Fase 4** — alertas por webhook com deduplicação e janela de silêncio, API
-  em FastAPI, página estática, agendamento idempotente.
 - **Fase 5** — integração com os projetos reais do portfólio, Docker Compose
   completo, CI, demonstração de incidentes de verdade.

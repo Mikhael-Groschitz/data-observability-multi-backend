@@ -1,8 +1,11 @@
 """Fixtures compartilhadas entre os testes."""
 
+import json
 import os
+import threading
 from collections.abc import Iterator
 from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
 import duckdb
@@ -66,3 +69,40 @@ def conexao_postgres(_postgres_disponivel: bool) -> Iterator["psycopg.Connection
     con = conectar_postgres_teste()
     yield con
     con.close()
+
+
+@dataclass
+class ServidorWebhook:
+    url: str
+    requisicoes: list[dict[str, Any]]
+
+
+@pytest.fixture
+def servidor_webhook() -> Iterator[ServidorWebhook]:
+    """Sobe um servidor HTTP real em localhost para capturar o POST do webhook.
+
+    Sem isso o teste só provaria que o código *tentaria* mandar algo — aqui
+    ele manda de verdade, para um servidor de verdade, só que local.
+    """
+    requisicoes: list[dict[str, Any]] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            tamanho = int(self.headers.get("Content-Length", 0))
+            corpo = self.rfile.read(tamanho)
+            requisicoes.append(json.loads(corpo))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, formato: str, *args: object) -> None:
+            pass
+
+    servidor = HTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=servidor.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{servidor.server_port}/"
+        yield ServidorWebhook(url=url, requisicoes=requisicoes)
+    finally:
+        servidor.shutdown()
+        thread.join(timeout=5)

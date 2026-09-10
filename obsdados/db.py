@@ -31,11 +31,15 @@ CREATE TABLE IF NOT EXISTS observabilidade.historico_metrica (
     linhas_buscadas       INTEGER NOT NULL,
     duracao_segundos      DOUBLE NOT NULL,
     parametros_metrica    VARCHAR,
+    chave_idempotencia    VARCHAR NOT NULL,
     _inserido_em          TIMESTAMP NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_historico_metrica_consulta
     ON observabilidade.historico_metrica (dataset, tipo_metrica, coluna, dimensao, coletado_em);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_historico_metrica_idempotente
+    ON observabilidade.historico_metrica (chave_idempotencia);
 
 CREATE SEQUENCE IF NOT EXISTS observabilidade.seq_incidente START 1;
 
@@ -57,6 +61,19 @@ CREATE TABLE IF NOT EXISTS observabilidade.incidente (
 
 CREATE INDEX IF NOT EXISTS idx_incidente_consulta
     ON observabilidade.incidente (dataset, regra, coluna, status);
+
+CREATE TABLE IF NOT EXISTS observabilidade.notificacao (
+    chave                  VARCHAR NOT NULL,
+    dataset                VARCHAR NOT NULL,
+    regra                  VARCHAR NOT NULL,
+    coluna                 VARCHAR,
+    ultimo_evento          VARCHAR NOT NULL,
+    ultima_notificacao_em  TIMESTAMP NOT NULL,
+    suprimidas             INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notificacao_chave
+    ON observabilidade.notificacao (chave);
 """
 
 

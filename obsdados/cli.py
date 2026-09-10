@@ -4,17 +4,17 @@ import argparse
 import json
 import os
 from collections.abc import Callable, Sequence
-from typing import Any
+from pathlib import Path
 
-import duckdb
-import psycopg
+import uvicorn
 
 from obsdados.adaptador import Adaptador
-from obsdados.adaptadores.adaptador_duckdb import AdaptadorDuckDB
-from obsdados.adaptadores.adaptador_postgres import AdaptadorPostgres
+from obsdados.agendador import executar_agendador
+from obsdados.alerta import TipoWebhook, notificar_avaliacao
 from obsdados.armazenamento import consultar_historico
-from obsdados.avaliador import avaliar_dataset
+from obsdados.avaliador import ResultadoAvaliacao, avaliar_dataset
 from obsdados.coletor import coletar_metrica
+from obsdados.conexao import ConfiguracaoOrigemInvalida, conectar_origem
 from obsdados.contrato import ContratoInvalido, carregar_contrato
 from obsdados.db import conectar_escrita, conectar_leitura, gravar_e_fechar
 from obsdados.incidente import Incidente, SeveridadeRegra, severidade_mais_grave
@@ -77,37 +77,30 @@ def _construir_parser() -> argparse.ArgumentParser:
     avaliar.add_argument("--store", default=os.environ.get("OBSDADOS_METRIC_STORE_PATH"))
     avaliar.set_defaults(func=_comando_avaliar)
 
+    agendar = subparsers.add_parser(
+        "agendar", help="coleta e avalia todos os contratos de um diretório, em ciclo"
+    )
+    agendar.add_argument("--contratos-dir", required=True, help="diretório com contratos *.yaml")
+    agendar.add_argument("--store", default=os.environ.get("OBSDADOS_METRIC_STORE_PATH"))
+    agendar.add_argument("--intervalo-segundos", type=float, default=60.0)
+    agendar.add_argument(
+        "--ciclos", type=int, default=None, help="número de ciclos (sem isso, roda para sempre)"
+    )
+    agendar.set_defaults(func=_comando_agendar)
+
+    servir = subparsers.add_parser("servir", help="sobe a API e a página em http://host:porta")
+    servir.add_argument("--host", default="127.0.0.1")
+    servir.add_argument("--porta", type=int, default=8000)
+    servir.set_defaults(func=_comando_servir)
+
     return parser
 
 
-def _conectar_postgres() -> "psycopg.Connection[Any]":
-    variaveis_obrigatorias = (
-        "OBSDADOS_POSTGRES_HOST",
-        "OBSDADOS_POSTGRES_BANCO",
-        "OBSDADOS_POSTGRES_USUARIO",
-    )
-    faltantes = [nome for nome in variaveis_obrigatorias if not os.environ.get(nome)]
-    if faltantes:
-        raise SystemExit(f"variáveis de ambiente obrigatórias ausentes: {', '.join(faltantes)}")
-    return psycopg.connect(
-        host=os.environ["OBSDADOS_POSTGRES_HOST"],
-        port=int(os.environ.get("OBSDADOS_POSTGRES_PORTA", "5432")),
-        dbname=os.environ["OBSDADOS_POSTGRES_BANCO"],
-        user=os.environ["OBSDADOS_POSTGRES_USUARIO"],
-        password=os.environ.get("OBSDADOS_POSTGRES_SENHA", ""),
-    )
-
-
-def _conectar_adaptador(args: argparse.Namespace) -> tuple[Adaptador, Callable[[], None]]:
-    if args.backend == "duckdb":
-        if not args.db_origem:
-            raise SystemExit("--db-origem é obrigatório para --backend duckdb")
-        con = duckdb.connect(args.db_origem, read_only=True)
-        return AdaptadorDuckDB(con), con.close
-    if args.backend == "postgres":
-        con_pg = _conectar_postgres()
-        return AdaptadorPostgres(con_pg), con_pg.close
-    raise SystemExit(f"backend desconhecido: {args.backend}")
+def _conectar_adaptador_cli(args: argparse.Namespace) -> tuple[Adaptador, Callable[[], None]]:
+    try:
+        return conectar_origem(args.backend, args.db_origem)
+    except ConfiguracaoOrigemInvalida as erro:
+        raise SystemExit(str(erro)) from erro
 
 
 def _montar_parametros(args: argparse.Namespace) -> dict[str, object]:
@@ -125,7 +118,7 @@ def _comando_coletar(args: argparse.Namespace) -> int:
     if not args.store:
         raise SystemExit(_ERRO_STORE_OBRIGATORIO)
 
-    adaptador, fechar_origem = _conectar_adaptador(args)
+    adaptador, fechar_origem = _conectar_adaptador_cli(args)
     try:
         especificacao = EspecificacaoMetrica(
             dataset=args.dataset,
@@ -172,34 +165,70 @@ def _comando_avaliar(args: argparse.Namespace) -> int:
 
     con = conectar_escrita(args.store)
     try:
-        incidentes = avaliar_dataset(contrato, con)
+        resultado = avaliar_dataset(contrato, con)
+        notificar_avaliacao(
+            con,
+            contrato,
+            resultado,
+            url=os.environ.get("OBSDADOS_WEBHOOK_URL"),
+            tipo=TipoWebhook(os.environ.get("OBSDADOS_WEBHOOK_TIPO", "discord")),
+        )
         con.execute("CHECKPOINT")
     finally:
         con.close()
 
-    print(json.dumps(_serializar_incidentes(contrato.dataset, incidentes), ensure_ascii=False))
-    if not incidentes:
+    print(json.dumps(_serializar_avaliacao(contrato.dataset, resultado), ensure_ascii=False))
+    if not resultado.abertos:
         return 0
-    pior = severidade_mais_grave([i.severidade for i in incidentes])
+    pior = severidade_mais_grave([i.severidade for i in resultado.abertos])
     return _CODIGO_SAIDA_POR_SEVERIDADE[pior]
 
 
-def _serializar_incidentes(dataset: str, incidentes: Sequence[Incidente]) -> dict[str, object]:
+def _serializar_incidente(incidente: Incidente) -> dict[str, object]:
+    return {
+        "regra": incidente.regra.value,
+        "coluna": incidente.coluna,
+        "severidade": incidente.severidade.value,
+        "valor_observado": incidente.valor_observado,
+        "valor_esperado": incidente.valor_esperado,
+        "desvio": incidente.desvio,
+        "justificativa": incidente.justificativa,
+    }
+
+
+def _serializar_avaliacao(dataset: str, resultado: ResultadoAvaliacao) -> dict[str, object]:
     return {
         "dataset": dataset,
-        "incidentes": [
-            {
-                "regra": incidente.regra.value,
-                "coluna": incidente.coluna,
-                "severidade": incidente.severidade.value,
-                "valor_observado": incidente.valor_observado,
-                "valor_esperado": incidente.valor_esperado,
-                "desvio": incidente.desvio,
-                "justificativa": incidente.justificativa,
-            }
-            for incidente in incidentes
-        ],
+        "incidentes": [_serializar_incidente(i) for i in resultado.abertos],
+        "resolvidos": [_serializar_incidente(i) for i in resultado.resolvidos],
     }
+
+
+def _comando_agendar(args: argparse.Namespace) -> int:
+    if not args.store:
+        raise SystemExit(_ERRO_STORE_OBRIGATORIO)
+    caminhos = sorted(Path(args.contratos_dir).glob("*.yaml"))
+    if not caminhos:
+        raise SystemExit(f"nenhum contrato .yaml encontrado em {args.contratos_dir}")
+
+    def _imprimir(dataset: str, resultado: ResultadoAvaliacao) -> None:
+        print(json.dumps(_serializar_avaliacao(dataset, resultado), ensure_ascii=False))
+
+    executar_agendador(
+        caminhos,
+        args.store,
+        webhook_url=os.environ.get("OBSDADOS_WEBHOOK_URL"),
+        webhook_tipo=TipoWebhook(os.environ.get("OBSDADOS_WEBHOOK_TIPO", "discord")),
+        intervalo_segundos=args.intervalo_segundos,
+        ciclos=args.ciclos,
+        ao_avaliar=_imprimir,
+    )
+    return 0
+
+
+def _comando_servir(args: argparse.Namespace) -> int:
+    uvicorn.run("obsdados.api:app", host=args.host, port=args.porta)
+    return 0
 
 
 def _comando_historico(args: argparse.Namespace) -> int:
