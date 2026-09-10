@@ -1,0 +1,15 @@
+dataset: bcb.sgs_observacao
+
+# Aponta para o metric store de outro projeto do portfólio (bcb-python-dbt),
+# assumindo os dois repositórios clonados lado a lado — ver README, seção
+# "Integração real: observando outro projeto do portfólio".
+conexao:
+  backend: duckdb
+  db_origem: ../projeto-bcb-python-dbt/bcb.duckdb
+
+tabela: raw.sgs_observacao
+
+frescor:
+  coluna: _carregado_em
+  sla_horas: 24
+  severidade: erro

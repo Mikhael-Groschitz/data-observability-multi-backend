@@ -78,6 +78,40 @@ def test_agendador_roda_todos_os_contratos_do_diretorio(tmp_path: Path) -> None:
     assert datasets_avaliados == {"ds_a", "ds_b"}
 
 
+def test_agendador_ignora_origem_indisponivel_e_continua(tmp_path: Path) -> None:
+    """Uma origem fora do ar (arquivo inexistente, banco caído) não pode derrubar o loop inteiro."""
+    contrato_valido = _preparar_contrato(tmp_path, "ds_a")
+    caminho_contrato_quebrado = tmp_path / "quebrado.yaml"
+    caminho_contrato_quebrado.write_text(
+        f"""
+dataset: ds_quebrado
+conexao:
+  backend: duckdb
+  db_origem: {tmp_path / "nao_existe.duckdb"}
+tabela: pedidos
+frescor:
+  coluna: criado_em
+  sla_horas: 24
+""",
+        encoding="utf-8",
+    )
+    store = str(tmp_path / "metricas.duckdb")
+    avaliacoes: list[tuple[str, ResultadoAvaliacao]] = []
+
+    executar_agendador(
+        [caminho_contrato_quebrado, contrato_valido],
+        store,
+        webhook_url=None,
+        webhook_tipo=TipoWebhook.DISCORD,
+        intervalo_segundos=5.0,
+        ciclos=1,
+        dormir=lambda _: None,
+        ao_avaliar=lambda dataset, resultado: avaliacoes.append((dataset, resultado)),
+    )
+
+    assert [dataset for dataset, _ in avaliacoes] == ["ds_a"]
+
+
 def test_agendador_ignora_contrato_invalido_e_continua(tmp_path: Path) -> None:
     contrato_valido = _preparar_contrato(tmp_path, "ds_a")
     contrato_invalido = tmp_path / "invalido.yaml"

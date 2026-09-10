@@ -4,14 +4,20 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
+import duckdb
+import psycopg
+
 from obsdados.alerta import TipoWebhook
 from obsdados.avaliador import ResultadoAvaliacao
 from obsdados.ciclo import executar_ciclo
+from obsdados.conexao import ConfiguracaoOrigemInvalida
 from obsdados.contrato import ContratoInvalido, carregar_contrato
 from obsdados.db import conectar_escrita
 from obsdados.logging_config import obter_logger
 
 _logger = obter_logger()
+
+_ERROS_ORIGEM_INDISPONIVEL = (ConfiguracaoOrigemInvalida, duckdb.Error, psycopg.Error)
 
 
 def executar_agendador(  # noqa: PLR0913
@@ -49,9 +55,13 @@ def _executar_um_contrato(
 
     con = conectar_escrita(store)
     try:
-        resultado = executar_ciclo(
-            contrato, con, webhook_url=webhook_url, webhook_tipo=webhook_tipo
-        )
+        try:
+            resultado = executar_ciclo(
+                contrato, con, webhook_url=webhook_url, webhook_tipo=webhook_tipo
+            )
+        except _ERROS_ORIGEM_INDISPONIVEL as erro:
+            _logger.warning("origem_indisponivel", dataset=contrato.dataset, erro=str(erro))
+            return None
         con.execute("CHECKPOINT")
     finally:
         con.close()

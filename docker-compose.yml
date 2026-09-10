@@ -15,5 +15,39 @@ services:
       timeout: 2s
       retries: 20
 
+  agendador:
+    build: .
+    command: ["agendar", "--contratos-dir", "/contratos", "--store", "/dados/metricas.duckdb", "--intervalo-segundos", "300"]
+    env_file:
+      - .env
+    environment:
+      # host/porta de rede interna do compose — ver README, "Decisões e trade-offs"
+      OBSDADOS_POSTGRES_HOST: postgres
+      OBSDADOS_POSTGRES_PORTA: "5432"
+      OBSDADOS_METRIC_STORE_PATH: /dados/metricas.duckdb
+    volumes:
+      - ./contratos:/contratos:ro
+      - obsdados_dados:/dados
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: ["servir", "--host", "0.0.0.0", "--porta", "8000"]
+    env_file:
+      - .env
+    environment:
+      OBSDADOS_METRIC_STORE_PATH: /dados/metricas.duckdb
+      OBSDADOS_CONTRATOS_DIR: /contratos
+    volumes:
+      - ./contratos:/contratos:ro
+      - obsdados_dados:/dados
+    ports:
+      - "8000:8000"
+    depends_on:
+      - agendador
+
 volumes:
   obsdados_pg_data:
+  obsdados_dados:

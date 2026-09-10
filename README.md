@@ -1,5 +1,7 @@
 # Observabilidade de Dados Multi-Backend
 
+[![CI](https://github.com/Mikhael-Groschitz/data-observability-multi-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/Mikhael-Groschitz/data-observability-multi-backend/actions/workflows/ci.yml)
+
 Serviço de observabilidade de dados: não move dado, observa dado que já foi
 movido por outro pipeline. O problema que resolve é o pipeline que termina com
 sucesso e mente — job verde, zero exceção, e a tabela chegou com metade do
@@ -21,7 +23,7 @@ Este é um projeto em fases:
 - [x] **Fase 2** — catálogo completo de métricas, segundo adapter (Postgres), amostragem, política de vazamento.
 - [x] **Fase 3** — contratos em YAML, baseline com mediana móvel e MAD, detecção de incidente.
 - [x] **Fase 4** — alertas por webhook, API, página, agendamento.
-- [ ] **Fase 5** — integração real, Docker Compose completo, CI.
+- [x] **Fase 5** — integração real com outro projeto do portfólio, Docker Compose completo, CI.
 
 ## Arquitetura
 
@@ -135,6 +137,13 @@ metric store, nunca escreve nele.
   `servir` (sobe a API).
 - **Log estruturado em JSON** via `structlog`, com dataset, métrica, duração e
   linhas trafegadas em cada coleta.
+- **Docker Compose completo** (`Dockerfile`, `docker-compose.yml`) — sobe o
+  Postgres de teste, o agendador e a API como serviços de verdade, os dois
+  últimos compartilhando um volume para o metric store. Nenhuma mudança de
+  código foi necessária: a escrita curta + leitura com retry da Fase 1 já
+  não assumia um único processo.
+- **CI no GitHub Actions** (`.github/workflows/ci.yml`) — lint, tipagem e
+  testes (com o Postgres isolado subindo no próprio workflow) a cada push.
 
 ## Instalação e uso
 
@@ -234,6 +243,23 @@ O resultado da coleta sai como uma linha JSON em stdout; o log estruturado vai
 para stderr. Os dois nunca se misturam, então dá para redirecionar a saída de
 resultado para um arquivo ou pipe sem filtrar log no meio.
 
+Ou subir o serviço inteiro de uma vez — Postgres de teste, agendador e API,
+os dois últimos como container, compartilhando um volume para o metric store:
+
+```bash
+cp .env.example .env   # se ainda não tiver feito
+docker compose up -d --build
+curl http://localhost:8000/health
+curl http://localhost:8000/datasets
+```
+
+O `agendador` só enxerga os contratos montados em `./contratos`; o
+`docker-compose.yml` não inclui nenhum dado de origem de exemplo, então uma
+coleta contra `contratos/exemplo.yaml` sem ajuste falha com `origem_indisponivel`
+no log — de propósito, é o que prova que o container não derruba o loop
+inteiro por causa disso (ver "O que quebrou"). `/datasets` já responde com o
+dataset do contrato mesmo antes de qualquer coleta bem-sucedida.
+
 ### Números medidos
 
 Contagem de linhas, DuckDB, tabelas de tamanhos bem diferentes:
@@ -332,6 +358,44 @@ o incidente se resolve — `/incidentes` volta a `[]`, `/datasets` mostra
 ```text
 [RESOLVIDO] fase4.pedidos - frescor voltou ao normal.
 ```
+
+### Integração real: observando outro projeto do portfólio
+
+Todo incidente mostrado até aqui neste README veio de dado que eu mesmo
+preparei na hora, só para a demonstração. Faltava a prova de que o serviço
+funciona contra dado de um pipeline de verdade, que eu não controlo. Apontei
+um contrato (`contratos_integracao/bcb_sgs_observacao.yaml`) para o metric
+store real do `projeto-bcb-python-dbt` — outro projeto do meu portfólio,
+clonado ao lado deste — observando `raw.sgs_observacao._carregado_em`, a
+coluna que marca quando cada linha foi carregada pela ingestão dele.
+
+```bash
+obsdados coletar --backend duckdb --db-origem ../projeto-bcb-python-dbt/bcb.duckdb \
+  --tabela raw.sgs_observacao --dataset bcb.sgs_observacao --tipo-metrica frescor \
+  --coluna _carregado_em --store metricas_integracao.duckdb
+obsdados avaliar --contrato contratos_integracao/bcb_sgs_observacao.yaml \
+  --store metricas_integracao.duckdb
+```
+
+Aquele projeto não roda continuamente — é um portfólio, não um serviço em
+produção — então a última carga já estava genuinamente parada havia dias.
+Sem eu forjar nada, a avaliação encontrou um incidente real:
+
+```json
+{"dataset": "bcb.sgs_observacao", "incidentes": [{"regra": "frescor",
+"coluna": "_carregado_em", "severidade": "erro",
+"valor_observado": "59.70 h sem atualizar",
+"valor_esperado": "até 24.00 h (SLA do contrato)",
+"desvio": "35.70 h acima do SLA",
+"justificativa": "coluna '_carregado_em' de 'bcb.sgs_observacao' está há
+59.70 h sem dado novo — SLA do contrato é 24.00 h"}], "resolvidos": []}
+```
+
+Código de saída `1` (severidade erro). Esse contrato fica fora do
+`contratos/` que o agendador e a API escaneiam por padrão — é uma
+demonstração pontual contra um repositório externo que nem todo mundo vai
+ter clonado do lado, não algo que deveria quebrar quem clona só este
+projeto (ver "Decisões e trade-offs").
 
 ## Decisões e trade-offs
 
@@ -480,6 +544,32 @@ estatística simples e explicável — mediana móvel com desvio absoluto median
 não um modelo. Um alerta que ninguém no time consegue justificar em uma frase
 é um alerta que é desligado na segunda semana.
 
+**Contrato de integração real fica fora de `contratos/` por padrão.** O
+agendador e a API escaneiam `contratos/` inteiro; um contrato apontando para
+o repositório de outro projeto quebraria (ou, pior, ficaria só logando aviso
+em loop) para qualquer pessoa que clone este projeto sozinho, sem o
+`projeto-bcb-python-dbt` do lado. `contratos_integracao/` existe separado,
+citado explicitamente no README, pra rodar sob demanda — não é escaneado por
+`--contratos-dir contratos` nem pelos serviços do Docker Compose.
+
+**O volume compartilhado do Compose não pediu nenhuma mudança de código.**
+O agendador e a API rodam em containers separados, lendo e escrevendo o
+mesmo arquivo de metric store por um volume nomeado. Isso só funciona sem
+ajuste porque a Fase 1 já tinha desenhado a concorrência do DuckDB como
+escrita curta (abre, grava, `CHECKPOINT`, fecha) mais leitura com retry —
+um desenho pensado pra dois processos quaisquer disputando o mesmo arquivo,
+não só dois processos no mesmo SO. Container ou não, a regra é a mesma.
+
+**`.env.example` vale para a máquina host; dentro do Compose, o Postgres tem
+outro endereço.** Os valores padrão (`localhost:5433`) são os que fazem
+sentido rodando `obsdados` direto no host, contra o Postgres exposto pelo
+`docker-compose.yml`. Dentro da rede interna do Compose, os containers se
+enxergam pelo nome do serviço — o Postgres é `postgres`, na porta interna
+`5432`, nunca `localhost:5433` (isso só existe do lado de fora, por causa do
+mapeamento de porta). Por isso `agendador`/`api` sobrescrevem
+`OBSDADOS_POSTGRES_HOST`/`OBSDADOS_POSTGRES_PORTA` no próprio
+`docker-compose.yml`, em vez de herdar os valores do `.env`.
+
 ## O que quebrou
 
 **Transação abortada no Postgres depois de um erro.** O adapter Postgres
@@ -518,6 +608,34 @@ segunda mensagem simplesmente não chegava — o que expôs o bug. Corrigido
 comparando também `ultimo_evento`: a janela só agrupa repetição do *mesmo*
 evento; uma mudança de aberto para resolvido (ou o contrário) sempre notifica
 na hora. Travado por um teste que reproduz exatamente essa sequência.
+
+**Uma origem indisponível derrubava o agendador inteiro, não só aquele
+dataset.** `_executar_um_contrato` só tratava `ContratoInvalido` (YAML mal
+formado); se a *conexão* com a origem falhasse — arquivo movido, banco fora
+do ar, permissão — a exceção subia crua e derrubava o processo do
+agendador, tirando observabilidade de todos os outros datasets daquela
+rodada, não só do que falhou. Isso não aparecia em nenhum teste anterior
+porque todo contrato de teste sempre apontava para um arquivo que existia.
+Ficou óbvio desenhando a integração real com `projeto-bcb-python-dbt`: uma
+segunda fonte de dado de verdade, gerenciada por outro projeto, pode estar
+fora do ar por motivos que não tenho controle nenhum — e um agendador que
+lê vários contratos não pode deixar um dataset instável apagar os outros.
+Corrigido ampliando o `except` para cobrir erro de conexão também, com o
+mesmo padrão de log-e-continua já usado para contrato inválido; travado por
+um teste com um contrato de origem inexistente ao lado de um válido.
+
+**API dentro do container não respondia — `uvicorn` escutava em
+`127.0.0.1`.** `obsdados servir` usa `127.0.0.1` como host padrão, certo
+para rodar direto na máquina. Subindo o Docker Compose de verdade pela
+primeira vez, `curl localhost:8000/health` conectava (o mapeamento de porta
+do Docker aceitava o handshake) e devolvia resposta vazia — o servidor
+escutava só a interface de loopback *de dentro* do container, invisível
+para qualquer tráfego vindo do host através da porta mapeada. Só apareceu
+rodando o container de verdade, não em teste algum (`TestClient` do FastAPI
+não passa pela pilha de rede). Corrigido passando `--host 0.0.0.0` no
+`command` do serviço `api` no `docker-compose.yml` — não é insegurança:
+essa interface só fica alcançável pelo que o Compose expõe explicitamente
+via `ports`.
 
 ## Por que não Great Expectations, Soda ou Elementary
 
@@ -593,10 +711,31 @@ Para ver o alerta saindo de verdade, aponte `OBSDADOS_WEBHOOK_URL` para um
 webhook real do Discord/Slack (ou para um servidor HTTP local, como os testes
 de `tests/test_alerta.py` fazem) antes de rodar `obsdados avaliar`.
 
+Para ver o serviço inteiro rodando em container (Postgres, agendador e API):
+
+```bash
+docker compose up -d --build
+curl http://localhost:8000/health
+curl http://localhost:8000/datasets
+docker compose logs agendador
+docker compose down
+```
+
+Para ver a integração real com outro projeto do portfólio, clone
+`projeto-bcb-python-dbt` no mesmo diretório pai deste repositório e rode:
+
+```bash
+uv run obsdados coletar --backend duckdb --db-origem ../projeto-bcb-python-dbt/bcb.duckdb \
+  --tabela raw.sgs_observacao --dataset bcb.sgs_observacao --tipo-metrica frescor \
+  --coluna _carregado_em --store metricas_integracao.duckdb
+uv run obsdados avaliar --contrato contratos_integracao/bcb_sgs_observacao.yaml \
+  --store metricas_integracao.duckdb
+```
+
+O CI (`.github/workflows/ci.yml`) roda exatamente `ruff check`, `mypy` e
+`pytest` a cada push para `main`, com o Postgres de teste subindo dentro do
+próprio workflow — o badge no topo deste README reflete a última execução
+real, não uma promessa.
+
 Nenhum dos arquivos `.duckdb` gerados aqui deve ser commitado — o
 `.gitignore` já cobre isso, junto com `.env`.
-
-## Próximos passos
-
-- **Fase 5** — integração com os projetos reais do portfólio, Docker Compose
-  completo, CI, demonstração de incidentes de verdade.
