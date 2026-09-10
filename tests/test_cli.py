@@ -50,3 +50,44 @@ def test_coletar_e_historico_ponta_a_ponta(
     saida_historico = capsys.readouterr().out
     assert "contagem_linhas" in saida_historico
     assert "ok" in saida_historico
+
+
+def test_coletar_maximo_exige_permite_valor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    origem = _preparar_banco_origem(tmp_path)
+    store = str(tmp_path / "metricas.duckdb")
+
+    codigo = main(
+        [
+            "coletar",
+            "--backend", "duckdb",
+            "--db-origem", origem,
+            "--tabela", "pedidos",
+            "--dataset", "teste.pedidos",
+            "--tipo-metrica", "maximo",
+            "--coluna", "id",
+            "--store", store,
+        ]
+    )
+    assert codigo == 0
+    bloqueado = json.loads(capsys.readouterr().out)
+    assert bloqueado["status"] == "nao_suportado"
+
+    codigo = main(
+        [
+            "coletar",
+            "--backend", "duckdb",
+            "--db-origem", origem,
+            "--tabela", "pedidos",
+            "--dataset", "teste.pedidos",
+            "--tipo-metrica", "maximo",
+            "--coluna", "id",
+            "--permite-valor",
+            "--store", store,
+        ]
+    )
+    assert codigo == 0
+    liberado = json.loads(capsys.readouterr().out)
+    assert liberado["status"] == "ok"
+    assert liberado["valor_texto"] == "8"

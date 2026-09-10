@@ -1,21 +1,23 @@
 """Leitura e escrita do histórico de métricas no metric store."""
 
+import json
+
 import duckdb
 
 from obsdados.nucleo import ResultadoMetrica, StatusResultadoMetrica, TipoAmostragem, TipoMetrica
 
 _SQL_INSERIR = """
 INSERT INTO observabilidade.historico_metrica (
-    dataset, tipo_metrica, dimensao, coletado_em, valor, status, tipo_amostragem,
-    motivo_nao_suportado, mensagem_erro, backend, linhas_buscadas, duracao_segundos,
-    parametros_metrica
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    dataset, tipo_metrica, dimensao, coluna, coletado_em, valor, valor_texto, status,
+    tipo_amostragem, motivo_nao_suportado, mensagem_erro, backend, linhas_buscadas,
+    duracao_segundos, parametros_metrica
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _SQL_CONSULTAR_BASE = """
-SELECT dataset, tipo_metrica, dimensao, status, valor, tipo_amostragem,
+SELECT dataset, tipo_metrica, dimensao, coluna, status, valor, valor_texto, tipo_amostragem,
        motivo_nao_suportado, mensagem_erro, backend, linhas_buscadas,
-       duracao_segundos, coletado_em
+       duracao_segundos, coletado_em, parametros_metrica
 FROM observabilidade.historico_metrica
 WHERE dataset = ?
 """
@@ -23,14 +25,17 @@ WHERE dataset = ?
 
 def gravar_resultado_metrica(con: duckdb.DuckDBPyConnection, resultado: ResultadoMetrica) -> None:
     """Grava um `ResultadoMetrica` como uma linha no histórico."""
+    parametros_json = json.dumps(dict(resultado.parametros)) if resultado.parametros else None
     con.execute(
         _SQL_INSERIR,
         [
             resultado.dataset,
             resultado.tipo_metrica.value,
             resultado.dimensao,
+            resultado.coluna,
             resultado.coletado_em,
             resultado.valor,
+            resultado.valor_texto,
             resultado.status.value,
             resultado.tipo_amostragem.value,
             resultado.motivo_nao_suportado,
@@ -38,7 +43,7 @@ def gravar_resultado_metrica(con: duckdb.DuckDBPyConnection, resultado: Resultad
             resultado.backend,
             resultado.linhas_buscadas,
             resultado.duracao_segundos,
-            None,
+            parametros_json,
         ],
     )
 
@@ -47,6 +52,7 @@ def consultar_historico(
     con: duckdb.DuckDBPyConnection,
     dataset: str,
     tipo_metrica: TipoMetrica | None = None,
+    coluna: str | None = None,
     limite: int = 100,
 ) -> list[ResultadoMetrica]:
     """Lê o histórico de um dataset, mais recente primeiro."""
@@ -55,6 +61,9 @@ def consultar_historico(
     if tipo_metrica is not None:
         sql += " AND tipo_metrica = ?"
         parametros.append(tipo_metrica.value)
+    if coluna is not None:
+        sql += " AND coluna = ?"
+        parametros.append(coluna)
     sql += " ORDER BY coletado_em DESC LIMIT ?"
     parametros.append(limite)
 
@@ -64,15 +73,18 @@ def consultar_historico(
             dataset=linha[0],
             tipo_metrica=TipoMetrica(linha[1]),
             dimensao=linha[2],
-            status=StatusResultadoMetrica(linha[3]),
-            valor=linha[4],
-            tipo_amostragem=TipoAmostragem(linha[5]),
-            motivo_nao_suportado=linha[6],
-            mensagem_erro=linha[7],
-            backend=linha[8],
-            linhas_buscadas=linha[9],
-            duracao_segundos=linha[10],
-            coletado_em=linha[11],
+            coluna=linha[3],
+            status=StatusResultadoMetrica(linha[4]),
+            valor=linha[5],
+            valor_texto=linha[6],
+            tipo_amostragem=TipoAmostragem(linha[7]),
+            motivo_nao_suportado=linha[8],
+            mensagem_erro=linha[9],
+            backend=linha[10],
+            linhas_buscadas=linha[11],
+            duracao_segundos=linha[12],
+            coletado_em=linha[13],
+            parametros=json.loads(linha[14]) if linha[14] else {},
         )
         for linha in linhas
     ]

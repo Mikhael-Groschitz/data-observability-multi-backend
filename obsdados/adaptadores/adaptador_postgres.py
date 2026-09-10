@@ -1,11 +1,17 @@
-"""Adapter de referência: lê datasets DuckDB via SQL empurrado para a própria conexão."""
+"""Segundo adapter: mesmo catálogo de métricas do DuckDB, dialeto Postgres.
+
+`CARDINALIDADE` é `nao_suportado` de propósito neste backend (ver README). Um
+erro de SQL deixa a transação da conexão abortada até um `rollback()` — por
+isso todo bloco de exceção chama `rollback()` antes de devolver o resultado.
+"""
 
 import time
 from datetime import datetime
+from typing import Any
 
-import duckdb
+import psycopg
 
-from obsdados.instrumentacao import ConexaoInstrumentadaDuckDB
+from obsdados.instrumentacao import ConexaoInstrumentadaPsycopg
 from obsdados.nucleo import (
     CAPACIDADE_POR_TIPO_METRICA,
     FRACAO_AMOSTRA_PADRAO,
@@ -24,44 +30,66 @@ from obsdados.nucleo import (
     TipoMetrica,
 )
 from obsdados.schema import calcular_hash_schema
-from obsdados.sql_util import identificador_seguro as _identificador_seguro
+from obsdados.sql_util import identificador_seguro
 
 _CAPACIDADES_SUPORTADAS = (
     Capacidade.CONTAGEM_LINHAS
     | Capacidade.FRESCOR
     | Capacidade.SCHEMA_HASH
     | Capacidade.TAXA_NULOS
-    | Capacidade.CONTAGEM_DISTINTOS_APROXIMADA
     | Capacidade.MINIMO_MAXIMO
     | Capacidade.QUANTIS
 )
 
-_SQL_ESTIMAR_COM_SCHEMA = (
-    "SELECT estimated_size FROM duckdb_tables() WHERE schema_name = ? AND table_name = ?"
-)
-_SQL_ESTIMAR_SEM_SCHEMA = "SELECT estimated_size FROM duckdb_tables() WHERE table_name = ?"
+_SQL_LISTAR_DATASETS = """
+SELECT n.nspname, c.relname, c.reltuples
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'r' AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+"""
+
+_SQL_DESCREVER_SCHEMA = """
+SELECT column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_schema = %s AND table_name = %s
+ORDER BY ordinal_position
+"""
+
+_SQL_ESTIMAR_LINHAS = """
+SELECT c.reltuples
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = %s AND c.relname = %s
+"""
 
 
-class AdaptadorDuckDB:
-    """Adapter para bancos DuckDB locais."""
+def _partes_tabela(tabela: str) -> tuple[str, str]:
+    schema, _, nome = tabela.rpartition(".")
+    return (schema or "public"), nome
 
-    nome_backend = "duckdb"
 
-    def __init__(self, conexao: duckdb.DuckDBPyConnection) -> None:
+class AdaptadorPostgres:
+    """Adapter para bancos PostgreSQL."""
+
+    nome_backend = "postgres"
+
+    def __init__(self, conexao: "psycopg.Connection[Any]") -> None:
         self._conexao = conexao
 
     def listar_datasets(self) -> list[DescricaoDataset]:
-        linhas = self._conexao.execute(
-            "SELECT schema_name, table_name, estimated_size FROM duckdb_tables()"
-        ).fetchall()
+        linhas = self._conexao.execute(_SQL_LISTAR_DATASETS).fetchall()
         return [
-            DescricaoDataset(tabela=nome, schema_ou_catalogo=schema, linhas_estimadas=estimado)
+            DescricaoDataset(
+                tabela=nome,
+                schema_ou_catalogo=schema,
+                linhas_estimadas=int(estimado) if estimado is not None and estimado >= 0 else None,
+            )
             for schema, nome, estimado in linhas
         ]
 
     def descrever_schema(self, tabela: str) -> list[ColunaSchema]:
-        sql = f"DESCRIBE {_identificador_seguro(tabela)}"  # noqa: S608
-        linhas = self._conexao.execute(sql).fetchall()
+        schema, nome = _partes_tabela(tabela)
+        linhas = self._conexao.execute(_SQL_DESCREVER_SCHEMA, [schema, nome]).fetchall()
         return [
             ColunaSchema(nome=linha[0], tipo=linha[1], aceita_nulo=linha[2] == "YES")
             for linha in linhas
@@ -71,18 +99,17 @@ class AdaptadorDuckDB:
         return _CAPACIDADES_SUPORTADAS
 
     def _estimar_linhas(self, tabela: str) -> int | None:
-        schema, _, nome = tabela.rpartition(".")
-        if schema:
-            linha = self._conexao.execute(_SQL_ESTIMAR_COM_SCHEMA, [schema, nome]).fetchone()
-        else:
-            linha = self._conexao.execute(_SQL_ESTIMAR_SEM_SCHEMA, [nome]).fetchone()
-        return int(linha[0]) if linha and linha[0] is not None else None
+        schema, nome = _partes_tabela(tabela)
+        linha = self._conexao.execute(_SQL_ESTIMAR_LINHAS, [schema, nome]).fetchone()
+        if linha is None or linha[0] is None or linha[0] < 0:
+            return None
+        return int(linha[0])
 
     def _decidir_amostragem(self, tabela: str) -> tuple[str, TipoAmostragem]:
         estimado = self._estimar_linhas(tabela)
         if estimado is not None and estimado > LIMITE_LINHAS_SEM_AMOSTRAGEM:
             percentual = round(FRACAO_AMOSTRA_PADRAO * 100)
-            return f" USING SAMPLE {percentual} PERCENT (bernoulli)", TipoAmostragem.AMOSTRA
+            return f" TABLESAMPLE BERNOULLI({percentual})", TipoAmostragem.AMOSTRA
         return "", TipoAmostragem.FULL_SCAN
 
     def executar_metrica(self, especificacao: EspecificacaoMetrica) -> ResultadoMetrica:
@@ -95,7 +122,6 @@ class AdaptadorDuckDB:
             TipoMetrica.FRESCOR: self._frescor,
             TipoMetrica.SCHEMA_HASH: self._schema_hash,
             TipoMetrica.TAXA_NULOS: self._taxa_nulos,
-            TipoMetrica.CARDINALIDADE: self._cardinalidade,
             TipoMetrica.MINIMO: lambda e: self._minimo_maximo(e, "MIN"),
             TipoMetrica.MAXIMO: lambda e: self._minimo_maximo(e, "MAX"),
             TipoMetrica.QUANTIL: self._quantil,
@@ -184,26 +210,26 @@ class AdaptadorDuckDB:
 
     def _contagem_linhas(self, especificacao: EspecificacaoMetrica) -> ResultadoMetrica:
         inicio = time.perf_counter()
-        instrumentada = ConexaoInstrumentadaDuckDB(self._conexao)
-        tabela_segura = _identificador_seguro(especificacao.tabela)
+        instrumentada = ConexaoInstrumentadaPsycopg(self._conexao)
+        tabela_segura = identificador_seguro(especificacao.tabela)
         where = ""
         valores: list[object] = []
         if especificacao.dimensao is not None:
             if not especificacao.coluna:
                 return self._erro(especificacao, "contagem por dimensão exige coluna")
-            coluna_segura = _identificador_seguro(especificacao.coluna)
+            coluna_segura = identificador_seguro(especificacao.coluna)
             por_dia = especificacao.parametros.get(PARAMETRO_GRANULARIDADE) == GRANULARIDADE_DIA
             if por_dia:
                 esquerda = f"date_trunc('day', {coluna_segura})"
-                direita = "date_trunc('day', CAST(? AS TIMESTAMP))"
-                where = f" WHERE {esquerda} = {direita}"
+                where = f" WHERE {esquerda} = date_trunc('day', %s::timestamp)"
             else:
-                where = f" WHERE {coluna_segura} = ?"
+                where = f" WHERE {coluna_segura} = %s"
             valores = [especificacao.dimensao]
         sql = f"SELECT COUNT(*) FROM {tabela_segura}{where}"  # noqa: S608
         try:
             linha = instrumentada.execute(sql, valores).fetchone()
-        except duckdb.Error as erro:
+        except psycopg.Error as erro:
+            self._conexao.rollback()
             return self._erro(especificacao, str(erro), instrumentada.linhas_buscadas_total)
         if linha is None:
             raise RuntimeError("consulta de contagem de linhas não retornou nenhuma linha")
@@ -214,13 +240,17 @@ class AdaptadorDuckDB:
         if not especificacao.coluna:
             return self._erro(especificacao, "frescor exige coluna com o timestamp de referência")
         inicio = time.perf_counter()
-        instrumentada = ConexaoInstrumentadaDuckDB(self._conexao)
-        coluna_segura = _identificador_seguro(especificacao.coluna)
-        tabela_segura = _identificador_seguro(especificacao.tabela)
-        sql = f"SELECT epoch(now() - MAX({coluna_segura})) FROM {tabela_segura}"  # noqa: S608
+        instrumentada = ConexaoInstrumentadaPsycopg(self._conexao)
+        coluna_segura = identificador_seguro(especificacao.coluna)
+        tabela_segura = identificador_seguro(especificacao.tabela)
+        sql = (
+            f"SELECT EXTRACT(EPOCH FROM (now() - MAX({coluna_segura}))) "  # noqa: S608
+            f"FROM {tabela_segura}"
+        )
         try:
             linha = instrumentada.execute(sql).fetchone()
-        except duckdb.Error as erro:
+        except psycopg.Error as erro:
+            self._conexao.rollback()
             return self._erro(especificacao, str(erro), instrumentada.linhas_buscadas_total)
         buscadas = instrumentada.linhas_buscadas_total
         if linha is None or linha[0] is None:
@@ -237,44 +267,22 @@ class AdaptadorDuckDB:
         if not especificacao.coluna:
             return self._erro(especificacao, "taxa_nulos exige coluna")
         inicio = time.perf_counter()
-        instrumentada = ConexaoInstrumentadaDuckDB(self._conexao)
-        coluna_segura = _identificador_seguro(especificacao.coluna)
+        instrumentada = ConexaoInstrumentadaPsycopg(self._conexao)
+        coluna_segura = identificador_seguro(especificacao.coluna)
         sufixo_amostra, tipo_amostragem = self._decidir_amostragem(especificacao.tabela)
-        tabela_segura = _identificador_seguro(especificacao.tabela)
+        tabela_segura = identificador_seguro(especificacao.tabela)
         sql = (
-            f"SELECT 1.0 - COUNT({coluna_segura})::DOUBLE / NULLIF(COUNT(*), 0) "  # noqa: S608
+            f"SELECT 1.0 - COUNT({coluna_segura})::float / NULLIF(COUNT(*), 0) "  # noqa: S608
             f"FROM {tabela_segura}{sufixo_amostra}"
         )
         try:
             linha = instrumentada.execute(sql).fetchone()
-        except duckdb.Error as erro:
+        except psycopg.Error as erro:
+            self._conexao.rollback()
             return self._erro(especificacao, str(erro), instrumentada.linhas_buscadas_total)
         buscadas = instrumentada.linhas_buscadas_total
         if linha is None or linha[0] is None:
             return self._erro(especificacao, "tabela vazia, taxa de nulos indefinida", buscadas)
-        return self._ok(
-            especificacao, inicio, buscadas, valor=float(linha[0]), tipo_amostragem=tipo_amostragem
-        )
-
-    def _cardinalidade(self, especificacao: EspecificacaoMetrica) -> ResultadoMetrica:
-        if not especificacao.coluna:
-            return self._erro(especificacao, "cardinalidade exige coluna")
-        inicio = time.perf_counter()
-        instrumentada = ConexaoInstrumentadaDuckDB(self._conexao)
-        coluna_segura = _identificador_seguro(especificacao.coluna)
-        sufixo_amostra, tipo_amostragem = self._decidir_amostragem(especificacao.tabela)
-        tabela_segura = _identificador_seguro(especificacao.tabela)
-        sql = (
-            f"SELECT approx_count_distinct({coluna_segura}) "  # noqa: S608
-            f"FROM {tabela_segura}{sufixo_amostra}"
-        )
-        try:
-            linha = instrumentada.execute(sql).fetchone()
-        except duckdb.Error as erro:
-            return self._erro(especificacao, str(erro), instrumentada.linhas_buscadas_total)
-        if linha is None:
-            raise RuntimeError("consulta de cardinalidade não retornou nenhuma linha")
-        buscadas = instrumentada.linhas_buscadas_total
         return self._ok(
             especificacao, inicio, buscadas, valor=float(linha[0]), tipo_amostragem=tipo_amostragem
         )
@@ -287,14 +295,15 @@ class AdaptadorDuckDB:
         if especificacao.parametros.get(PARAMETRO_PERMITE_VALOR) is not True:
             return self._nao_suportado_por_politica(especificacao)
         inicio = time.perf_counter()
-        instrumentada = ConexaoInstrumentadaDuckDB(self._conexao)
-        coluna_segura = _identificador_seguro(especificacao.coluna)
+        instrumentada = ConexaoInstrumentadaPsycopg(self._conexao)
+        coluna_segura = identificador_seguro(especificacao.coluna)
         sufixo_amostra, tipo_amostragem = self._decidir_amostragem(especificacao.tabela)
-        tabela_segura = _identificador_seguro(especificacao.tabela)
+        tabela_segura = identificador_seguro(especificacao.tabela)
         sql = f"SELECT {funcao_sql}({coluna_segura}) FROM {tabela_segura}{sufixo_amostra}"  # noqa: S608
         try:
             linha = instrumentada.execute(sql).fetchone()
-        except duckdb.Error as erro:
+        except psycopg.Error as erro:
+            self._conexao.rollback()
             return self._erro(especificacao, str(erro), instrumentada.linhas_buscadas_total)
         buscadas = instrumentada.linhas_buscadas_total
         if linha is None or linha[0] is None:
@@ -313,17 +322,18 @@ class AdaptadorDuckDB:
         if especificacao.parametros.get(PARAMETRO_PERMITE_VALOR) is not True:
             return self._nao_suportado_por_politica(especificacao)
         inicio = time.perf_counter()
-        instrumentada = ConexaoInstrumentadaDuckDB(self._conexao)
-        coluna_segura = _identificador_seguro(especificacao.coluna)
+        instrumentada = ConexaoInstrumentadaPsycopg(self._conexao)
+        coluna_segura = identificador_seguro(especificacao.coluna)
         sufixo_amostra, tipo_amostragem = self._decidir_amostragem(especificacao.tabela)
-        tabela_segura = _identificador_seguro(especificacao.tabela)
+        tabela_segura = identificador_seguro(especificacao.tabela)
         sql = (
-            f"SELECT quantile_cont({coluna_segura}, ?) "  # noqa: S608
+            f"SELECT percentile_cont(%s) WITHIN GROUP (ORDER BY {coluna_segura}) "  # noqa: S608
             f"FROM {tabela_segura}{sufixo_amostra}"
         )
         try:
             linha = instrumentada.execute(sql, [quantil]).fetchone()
-        except duckdb.Error as erro:
+        except psycopg.Error as erro:
+            self._conexao.rollback()
             return self._erro(especificacao, str(erro), instrumentada.linhas_buscadas_total)
         buscadas = instrumentada.linhas_buscadas_total
         if linha is None or linha[0] is None:

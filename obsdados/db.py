@@ -19,8 +19,10 @@ CREATE TABLE IF NOT EXISTS observabilidade.historico_metrica (
     dataset               VARCHAR NOT NULL,
     tipo_metrica          VARCHAR NOT NULL,
     dimensao              VARCHAR,
+    coluna                VARCHAR,
     coletado_em           TIMESTAMP NOT NULL,
     valor                 DOUBLE,
+    valor_texto           VARCHAR,
     status                VARCHAR NOT NULL,
     tipo_amostragem       VARCHAR NOT NULL DEFAULT 'nao_aplicavel',
     motivo_nao_suportado  VARCHAR,
@@ -33,7 +35,7 @@ CREATE TABLE IF NOT EXISTS observabilidade.historico_metrica (
 );
 
 CREATE INDEX IF NOT EXISTS idx_historico_metrica_consulta
-    ON observabilidade.historico_metrica (dataset, tipo_metrica, dimensao, coletado_em);
+    ON observabilidade.historico_metrica (dataset, tipo_metrica, coluna, dimensao, coletado_em);
 """
 
 

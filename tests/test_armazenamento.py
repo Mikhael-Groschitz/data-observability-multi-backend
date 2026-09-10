@@ -56,3 +56,32 @@ def test_consultar_historico_respeita_limite() -> None:
     historico = consultar_historico(con, "ds", limite=2)
 
     assert len(historico) == 2
+
+
+def test_consultar_historico_filtra_por_coluna() -> None:
+    con = conectar_escrita(":memory:")
+    gravar_resultado_metrica(con, _resultado(coluna="valor", tipo_metrica=TipoMetrica.TAXA_NULOS))
+    gravar_resultado_metrica(con, _resultado(coluna="regiao", tipo_metrica=TipoMetrica.TAXA_NULOS))
+
+    historico = consultar_historico(con, "ds", coluna="valor")
+
+    assert len(historico) == 1
+    assert historico[0].coluna == "valor"
+
+
+def test_valor_texto_e_parametros_sao_preservados() -> None:
+    con = conectar_escrita(":memory:")
+    gravar_resultado_metrica(
+        con,
+        _resultado(
+            tipo_metrica=TipoMetrica.SCHEMA_HASH,
+            valor=None,
+            valor_texto="abc123",
+            parametros={"quantil": 0.95},
+        ),
+    )
+
+    historico = consultar_historico(con, "ds")
+
+    assert historico[0].valor_texto == "abc123"
+    assert historico[0].parametros == {"quantil": 0.95}

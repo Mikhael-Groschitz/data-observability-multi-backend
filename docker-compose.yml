@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: obsdados
+      POSTGRES_PASSWORD: obsdados_dev
+      POSTGRES_DB: obsdados_teste
+    ports:
+      - "5433:5432"
+    volumes:
+      - obsdados_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U obsdados -d obsdados_teste"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+volumes:
+  obsdados_pg_data:
