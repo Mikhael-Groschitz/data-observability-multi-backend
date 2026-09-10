@@ -6,6 +6,7 @@ isso todo bloco de exceção chama `rollback()` antes de devolver o resultado.
 """
 
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
@@ -17,6 +18,7 @@ from obsdados.nucleo import (
     FRACAO_AMOSTRA_PADRAO,
     GRANULARIDADE_DIA,
     LIMITE_LINHAS_SEM_AMOSTRAGEM,
+    PARAMETRO_COLUNAS_SCHEMA,
     PARAMETRO_GRANULARIDADE,
     PARAMETRO_PERMITE_VALOR,
     PARAMETRO_QUANTIL,
@@ -191,6 +193,7 @@ class AdaptadorPostgres:
         valor: float | None = None,
         valor_texto: str | None = None,
         tipo_amostragem: TipoAmostragem = TipoAmostragem.FULL_SCAN,
+        parametros: Mapping[str, object] | None = None,
     ) -> ResultadoMetrica:
         return ResultadoMetrica(
             dataset=especificacao.dataset,
@@ -205,7 +208,7 @@ class AdaptadorPostgres:
             linhas_buscadas=linhas_buscadas,
             duracao_segundos=time.perf_counter() - inicio,
             coletado_em=datetime.now(),
-            parametros=especificacao.parametros,
+            parametros=especificacao.parametros if parametros is None else parametros,
         )
 
     def _contagem_linhas(self, especificacao: EspecificacaoMetrica) -> ResultadoMetrica:
@@ -261,7 +264,13 @@ class AdaptadorPostgres:
         inicio = time.perf_counter()
         colunas = self.descrever_schema(especificacao.tabela)
         hash_atual = calcular_hash_schema(colunas)
-        return self._ok(especificacao, inicio, linhas_buscadas=len(colunas), valor_texto=hash_atual)
+        return self._ok(
+            especificacao,
+            inicio,
+            linhas_buscadas=len(colunas),
+            valor_texto=hash_atual,
+            parametros={PARAMETRO_COLUNAS_SCHEMA: [c.model_dump() for c in colunas]},
+        )
 
     def _taxa_nulos(self, especificacao: EspecificacaoMetrica) -> ResultadoMetrica:
         if not especificacao.coluna:

@@ -36,6 +36,27 @@ CREATE TABLE IF NOT EXISTS observabilidade.historico_metrica (
 
 CREATE INDEX IF NOT EXISTS idx_historico_metrica_consulta
     ON observabilidade.historico_metrica (dataset, tipo_metrica, coluna, dimensao, coletado_em);
+
+CREATE SEQUENCE IF NOT EXISTS observabilidade.seq_incidente START 1;
+
+CREATE TABLE IF NOT EXISTS observabilidade.incidente (
+    id                BIGINT PRIMARY KEY DEFAULT nextval('observabilidade.seq_incidente'),
+    dataset           VARCHAR NOT NULL,
+    regra             VARCHAR NOT NULL,
+    coluna            VARCHAR,
+    severidade        VARCHAR NOT NULL,
+    status            VARCHAR NOT NULL DEFAULT 'aberto',
+    valor_observado   VARCHAR NOT NULL,
+    valor_esperado    VARCHAR NOT NULL,
+    desvio            VARCHAR NOT NULL,
+    justificativa     VARCHAR NOT NULL,
+    detectado_em      TIMESTAMP NOT NULL,
+    resolvido_em      TIMESTAMP,
+    _inserido_em      TIMESTAMP NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_incidente_consulta
+    ON observabilidade.incidente (dataset, regra, coluna, status);
 """
 
 

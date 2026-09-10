@@ -68,6 +68,9 @@ LIMITE_LINHAS_SEM_AMOSTRAGEM: Final[int] = 100_000
 FRACAO_AMOSTRA_PADRAO: Final[float] = 0.1
 """Fração da tabela lida quando a amostragem é acionada."""
 
+PARAMETRO_COLUNAS_SCHEMA: Final[str] = "colunas"
+"""Chave de `parametros` do resultado de SCHEMA_HASH com o snapshot de colunas."""
+
 
 class StatusResultadoMetrica(StrEnum):
     """Resultado da tentativa de coletar uma métrica."""

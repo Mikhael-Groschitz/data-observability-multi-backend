@@ -19,7 +19,7 @@ Este é um projeto em fases:
 
 - [x] **Fase 1** — núcleo, protocolo de adapter, adapter DuckDB de referência, metric store.
 - [x] **Fase 2** — catálogo completo de métricas, segundo adapter (Postgres), amostragem, política de vazamento.
-- [ ] **Fase 3** — contratos em YAML, baseline com mediana móvel e MAD, detecção de incidente.
+- [x] **Fase 3** — contratos em YAML, baseline com mediana móvel e MAD, detecção de incidente.
 - [ ] **Fase 4** — alertas por webhook, API, página, agendamento.
 - [ ] **Fase 5** — integração real, Docker Compose completo, CI.
 
@@ -27,17 +27,19 @@ Este é um projeto em fases:
 
 ```mermaid
 flowchart LR
-    C[contratos YAML] --> COL[coletor]
-    COL --> AD[adapters]
+    C[contratos YAML] --> AV[avaliador]
+    COL[coletor] --> AD[adapters]
     AD -->|SQL empurrado| DB[("DuckDB / Postgres / SQL Server / Delta")]
     COL --> MS[(metric store)]
-    MS --> AV[avaliador]
+    MS --> AV
+    AV --> MS
     AV --> ALT[alertas]
     AV --> API[API + página]
 ```
 
-Hoje existem `coletor`, `adapters` (DuckDB e Postgres) e `metric store`. O
-resto do diagrama é o destino, não o estado atual.
+Hoje existem `coletor`, `adapters` (DuckDB e Postgres), `metric store` e
+`avaliador` (que lê o contrato e o metric store, e escreve incidente de volta
+no store). `alertas` e `API + página` são o destino, ainda não construído.
 
 ## O que o serviço faz hoje
 
@@ -73,12 +75,43 @@ resto do diagrama é o destino, não o estado atual.
 - **Política de materialização de valor** — mínimo, máximo e quantil só
   calculam o valor real se a chamada vier com `parametros.permite_valor=true`
   (CLI: `--permite-valor`). Sem isso, o resultado é `nao_suportado` com o
-  motivo explícito — é um substituto provisório para o controle por coluna
-  que o contrato da Fase 3 vai assumir.
+  motivo explícito. Continua um controle por chamada, não por coluna dentro
+  do contrato — o contrato desta fase cobre frescor/volume/schema/nulos, não
+  esse mecanismo.
 - **Metric store em DuckDB** (`obsdados/db.py`, `obsdados/armazenamento.py`) —
-  histórico de `(dataset, métrica, coluna, dimensão, timestamp, valor)`.
-- **CLI** (`obsdados/cli.py`) — `obsdados coletar` e `obsdados historico`,
-  contra DuckDB ou Postgres.
+  histórico de `(dataset, métrica, coluna, dimensão, timestamp, valor)`, mais
+  a tabela de incidentes.
+- **Contrato declarativo em YAML** (`obsdados/contrato.py`) — um arquivo por
+  dataset, validado com Pydantic v2. Erro de sintaxe YAML e erro de schema
+  (campo obrigatório ausente, tipo errado, campo desconhecido) apontam a
+  linha do problema. Descreve conexão, tabela, regra de frescor (SLA),
+  regra de volume (severidade, mínimo de observações, limite de desvio),
+  regra de schema (severidade por tipo de mudança), regras de nulos por
+  coluna e política de amostragem. Exemplo em `contratos/exemplo.yaml`.
+- **Baseline com mediana e MAD, nunca média com desvio padrão**
+  (`obsdados/baseline.py`) — uma carga anômala contamina a própria média, e a
+  detecção fica cega justo depois do incidente. Mediana e desvio absoluto
+  mediano resistem a um outlier isolado no histórico.
+- **Sazonalidade por dia da semana** — a baseline de volume é calculada
+  separadamente por dia da semana: volume de sábado nunca é comparado contra
+  a mediana de segunda-feira.
+- **Partida a fria** — sem `minimo_observacoes_baseline` (padrão 5) pontos do
+  mesmo dia da semana no histórico, o incidente estatístico de volume fica
+  suspenso; as regras por limiar do contrato (frescor, nulos, schema)
+  continuam valendo desde a primeira coleta.
+- **Severidade com efeito distinto, hoje** — aviso/erro/crítico definem o
+  código de saída de `obsdados avaliar` (0/1/2). Antes de existir alerta
+  (Fase 4), já dá pra usar isso para falhar um pipeline de CI.
+- **Incidente persistido com ciclo de vida** (`obsdados/incidente.py`) — cada
+  disparo vira uma linha com valor observado, esperado, desvio e
+  justificativa. Um incidente já aberto não duplica na rodada seguinte, e se
+  resolve sozinho quando a condição deixa de valer.
+- **Avaliador só lê o metric store, nunca a origem** (`obsdados/avaliador.py`)
+  — inclusive o snapshot de colunas usado para classificar mudança de schema
+  já foi coletado antes; avaliar um dataset não abre conexão nova com o banco
+  observado.
+- **CLI** (`obsdados/cli.py`) — `obsdados coletar`, `obsdados historico` e
+  `obsdados avaliar`, contra DuckDB ou Postgres.
 - **Log estruturado em JSON** via `structlog`, com dataset, métrica, duração e
   linhas trafegadas em cada coleta.
 
@@ -135,6 +168,16 @@ Ler o histórico de um dataset (opcionalmente filtrando por coluna):
 obsdados historico --store metricas.duckdb --dataset vendas.pedidos --coluna valor
 ```
 
+Avaliar um dataset contra o contrato (`contratos/exemplo.yaml` tem um modelo
+completo) e persistir os incidentes que dispararem:
+
+```bash
+obsdados avaliar --contrato contratos/exemplo.yaml --store metricas.duckdb
+```
+
+O código de saída é `0` sem incidente ou só aviso, `1` se o pior incidente for
+erro, `2` se for crítico — dá pra usar isso direto num step de CI.
+
 O resultado da coleta sai como uma linha JSON em stdout; o log estruturado vai
 para stderr. Os dois nunca se misturam, então dá para redirecionar a saída de
 resultado para um arquivo ou pipe sem filtrar log no meio.
@@ -165,9 +208,38 @@ escala com o volume porque o agregado roda inteiro dentro do banco; é essa
 independência que a regra de push-down existe para garantir. (Números de uma
 máquina de desenvolvimento comum — mostram ordem de grandeza, não SLA.)
 
-A suíte de testes completa (67 testes, incluindo os 14 que rodam contra um
-Postgres real via Docker) roda em cerca de 3 segundos com o Postgres no ar, e
-pula os testes de Postgres — sem falhar — quando ele não está acessível.
+A suíte de testes completa (92 testes, incluindo os que rodam contra um
+Postgres real via Docker) roda em poucos segundos com o Postgres no ar, e pula
+os testes de Postgres — sem falhar — quando ele não está acessível.
+
+### Anomalia sintética, de verdade (não só nos testes)
+
+Rodando `obsdados avaliar` de verdade contra uma tabela DuckDB com timestamp de
+30 horas atrás (SLA do contrato é 24h):
+
+```json
+{"dataset": "demo.pedidos", "incidentes": [{"regra": "frescor", "coluna": "criado_em",
+"severidade": "erro", "valor_observado": "30.00 h sem atualizar",
+"valor_esperado": "até 24.00 h (SLA do contrato)", "desvio": "6.00 h acima do SLA",
+"justificativa": "coluna 'criado_em' de 'demo.pedidos' está há 30.00 h sem dado novo
+— SLA do contrato é 24.00 h"}]}
+```
+
+Removendo a coluna `regiao` da mesma tabela e coletando `schema_hash` de novo:
+
+```json
+{"dataset": "demo.pedidos", "incidentes": [{"regra": "schema", "coluna": null,
+"severidade": "critico", "valor_observado": "hash 954f46c0b40f...",
+"valor_esperado": "hash bcc5008226a7...", "desvio": "quebradora",
+"justificativa": "schema de 'demo.pedidos' mudou (quebradora): colunas removidas: ['regiao']"}]}
+```
+
+Código de saída dessa segunda chamada: `2` (crítico) — os dois incidentes
+ficam abertos ao mesmo tempo no metric store. O cenário de volume pela metade
+(que precisa de várias semanas de histórico por dia da semana) está
+reproduzido e verificado em `tests/test_avaliador.py::test_volume_incidente_quando_cai_pela_metade`,
+com os mesmos números: baseline de ~1002 linhas (mediana de 6 semanas),
+observação de 500, desvio de dezenas de MADs acima do limite de 5.
 
 ## Decisões e trade-offs
 
@@ -241,6 +313,41 @@ colunas não numéricas, que não fazem sentido guardar como `DOUBLE`).
 `multiprocessing.Event` para saber quando o outro processo realmente conectou
 ou realmente gravou. O retry de leitura do metric store é limitado e
 determinístico (número de tentativas fixo, função de espera injetável).
+
+**Partida a fria: por que 5 observações do mesmo dia da semana.** Cinco
+semanas de histórico é pouco tempo para travar um dataset novo sem nenhuma
+checagem estatística, mas já dá uma mediana com alguma robustez — abaixo
+disso, a mediana de 2 ou 3 pontos é fácil demais de acertar por coincidência.
+O número é configurável por contrato (`minimo_observacoes_baseline`) porque
+um dataset com coleta mensal, por exemplo, precisa de outro valor.
+
+**Dedup de incidente por estado, não por janela de tempo.** Um incidente só é
+criado se não existir outro já aberto para a mesma (dataset, regra, coluna);
+reavaliar sem nada mudar não duplica linha. Isso não é a janela de silêncio
+que a Fase 4 vai trazer para alertas (que lida com tempo) — é mais simples:
+um problema continua sendo o mesmo problema até se resolver, não importa
+quantas vezes o avaliador rodar nesse meio tempo.
+
+**Diff de schema precisa do snapshot de colunas, não só do hash.** O hash
+sozinho diz "mudou", não "o quê" — para classificar aditiva vs. quebradora, o
+avaliador precisa comparar as duas listas de colunas. Em vez de uma tabela
+nova só para isso, a lista de colunas viaja como JSON dentro de `parametros`
+do próprio resultado de `SCHEMA_HASH` — o metric store já serializa esse
+campo, então bastou usá-lo.
+
+**Contrato nunca guarda credencial.** A seção `conexao` tem `backend` e, para
+DuckDB, `db_origem` (caminho de arquivo, não segredo); para Postgres, só
+`backend: postgres` — usuário e senha continuam vindo de
+`OBSDADOS_POSTGRES_*` no ambiente, como desde a Fase 2. Um contrato pode ser
+versionado no git sem vazar nada.
+
+**Erro de contrato aponta linha usando a árvore do YAML, não o dict já
+validado.** Depois que o YAML vira um `dict` Python, a linha de cada valor já
+foi embora — por isso o carregador usa `yaml.compose()` para manter a árvore
+de nós com posição, e caminha por ela seguindo o mesmo `loc` que o Pydantic
+devolve no erro de validação. Erro de sintaxe YAML já vem com linha do
+próprio parser; erro de validação (campo errado, tipo errado) precisa desse
+passo a mais.
 
 **Sem machine learning.** A detecção deste projeto, mesmo nas fases futuras, é
 estatística simples e explicável — mediana móvel com desvio absoluto mediano,
@@ -321,14 +428,18 @@ uv run obsdados coletar --backend duckdb --db-origem origem.duckdb \
 uv run obsdados historico --store metricas.duckdb --dataset teste.pedidos
 ```
 
+Para ver um incidente de verdade, ajuste `contratos/exemplo.yaml` para
+apontar para esse `origem.duckdb`/`pedidos` e rode:
+
+```bash
+uv run obsdados avaliar --contrato contratos/exemplo.yaml --store metricas.duckdb
+```
+
 Nenhum dos arquivos `.duckdb` gerados aqui deve ser commitado — o
 `.gitignore` já cobre isso, junto com `.env`.
 
 ## Próximos passos
 
-- **Fase 3** — contratos declarativos em YAML validados com Pydantic,
-  baseline com mediana móvel e MAD, sazonalidade por dia da semana, partida a
-  frio, severidade e incidentes persistidos.
 - **Fase 4** — alertas por webhook com deduplicação e janela de silêncio, API
   em FastAPI, página estática, agendamento idempotente.
 - **Fase 5** — integração com os projetos reais do portfólio, Docker Compose

@@ -1,0 +1,30 @@
+dataset: vendas.pedidos
+
+conexao:
+  backend: duckdb
+  db_origem: origem.duckdb
+
+tabela: vendas.pedidos
+
+frescor:
+  coluna: criado_em
+  sla_horas: 24
+  severidade: erro
+
+volume:
+  severidade: critico
+  minimo_observacoes_baseline: 5
+  limite_desvios_mad: 5.0
+
+schema:
+  severidade_aditiva: aviso
+  severidade_quebradora: critico
+
+nulos:
+  - coluna: valor
+    limite_taxa: 0.05
+    severidade: aviso
+
+amostragem:
+  limite_linhas_sem_amostragem: 100000
+  fracao: 0.1

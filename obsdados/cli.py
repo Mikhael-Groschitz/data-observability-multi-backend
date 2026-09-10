@@ -13,8 +13,11 @@ from obsdados.adaptador import Adaptador
 from obsdados.adaptadores.adaptador_duckdb import AdaptadorDuckDB
 from obsdados.adaptadores.adaptador_postgres import AdaptadorPostgres
 from obsdados.armazenamento import consultar_historico
+from obsdados.avaliador import avaliar_dataset
 from obsdados.coletor import coletar_metrica
+from obsdados.contrato import ContratoInvalido, carregar_contrato
 from obsdados.db import conectar_escrita, conectar_leitura, gravar_e_fechar
+from obsdados.incidente import Incidente, SeveridadeRegra, severidade_mais_grave
 from obsdados.logging_config import configurar_logging
 from obsdados.nucleo import (
     GRANULARIDADE_DIA,
@@ -26,6 +29,8 @@ from obsdados.nucleo import (
     StatusResultadoMetrica,
     TipoMetrica,
 )
+
+_ERRO_STORE_OBRIGATORIO = "--store é obrigatório (ou defina OBSDADOS_METRIC_STORE_PATH)"
 
 
 def _construir_parser() -> argparse.ArgumentParser:
@@ -64,6 +69,13 @@ def _construir_parser() -> argparse.ArgumentParser:
     historico.add_argument("--coluna", help="filtra o histórico por coluna")
     historico.add_argument("--limite", type=int, default=20)
     historico.set_defaults(func=_comando_historico)
+
+    avaliar = subparsers.add_parser(
+        "avaliar", help="avalia um dataset contra o contrato e persiste os incidentes"
+    )
+    avaliar.add_argument("--contrato", required=True, help="caminho do arquivo YAML do contrato")
+    avaliar.add_argument("--store", default=os.environ.get("OBSDADOS_METRIC_STORE_PATH"))
+    avaliar.set_defaults(func=_comando_avaliar)
 
     return parser
 
@@ -111,7 +123,7 @@ def _montar_parametros(args: argparse.Namespace) -> dict[str, object]:
 
 def _comando_coletar(args: argparse.Namespace) -> int:
     if not args.store:
-        raise SystemExit("--store é obrigatório (ou defina OBSDADOS_METRIC_STORE_PATH)")
+        raise SystemExit(_ERRO_STORE_OBRIGATORIO)
 
     adaptador, fechar_origem = _conectar_adaptador(args)
     try:
@@ -143,9 +155,56 @@ def _comando_coletar(args: argparse.Namespace) -> int:
     return 1 if resultado.status == StatusResultadoMetrica.ERRO else 0
 
 
+_CODIGO_SAIDA_POR_SEVERIDADE = {
+    SeveridadeRegra.AVISO: 0,
+    SeveridadeRegra.ERRO: 1,
+    SeveridadeRegra.CRITICO: 2,
+}
+
+
+def _comando_avaliar(args: argparse.Namespace) -> int:
+    if not args.store:
+        raise SystemExit(_ERRO_STORE_OBRIGATORIO)
+    try:
+        contrato = carregar_contrato(args.contrato)
+    except ContratoInvalido as erro:
+        raise SystemExit(str(erro)) from erro
+
+    con = conectar_escrita(args.store)
+    try:
+        incidentes = avaliar_dataset(contrato, con)
+        con.execute("CHECKPOINT")
+    finally:
+        con.close()
+
+    print(json.dumps(_serializar_incidentes(contrato.dataset, incidentes), ensure_ascii=False))
+    if not incidentes:
+        return 0
+    pior = severidade_mais_grave([i.severidade for i in incidentes])
+    return _CODIGO_SAIDA_POR_SEVERIDADE[pior]
+
+
+def _serializar_incidentes(dataset: str, incidentes: Sequence[Incidente]) -> dict[str, object]:
+    return {
+        "dataset": dataset,
+        "incidentes": [
+            {
+                "regra": incidente.regra.value,
+                "coluna": incidente.coluna,
+                "severidade": incidente.severidade.value,
+                "valor_observado": incidente.valor_observado,
+                "valor_esperado": incidente.valor_esperado,
+                "desvio": incidente.desvio,
+                "justificativa": incidente.justificativa,
+            }
+            for incidente in incidentes
+        ],
+    }
+
+
 def _comando_historico(args: argparse.Namespace) -> int:
     if not args.store:
-        raise SystemExit("--store é obrigatório (ou defina OBSDADOS_METRIC_STORE_PATH)")
+        raise SystemExit(_ERRO_STORE_OBRIGATORIO)
 
     con = conectar_leitura(args.store)
     try:
